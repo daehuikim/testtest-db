@@ -319,7 +319,8 @@ def expanding_cv_mape(
                 X_seq_val = build_sequence_array(data.iloc[valid_idx], seq_cols)
                 m = LSTMWrapper(
                     seq_len=len(seq_cols), hidden=cfg.get("hidden", 64), layers=cfg.get("layers", 2),
-                    epochs=cfg.get("epochs", 50), patience=cfg.get("patience", 10),
+                    epochs=cfg.get("epochs", 100), patience=cfg.get("patience", 10),
+                    dropout=cfg.get("dropout", 0.2),
                 )
                 m.fit(X_seq_tr, y_tr, X_val=X_seq_val, y_val=y_train[valid_idx])
                 pred_val = m.predict(X_seq_val)
@@ -333,8 +334,8 @@ def expanding_cv_mape(
                 X_seq_val = build_sequence_array(data.iloc[valid_idx], seq_cols)
                 m = TransformerWrapper(
                     seq_len=len(seq_cols), d_model=cfg.get("d_model", 32), nhead=cfg.get("nhead", 4),
-                    num_layers=cfg.get("num_layers", 2), epochs=cfg.get("epochs", 50),
-                    patience=cfg.get("patience", 10),
+                    num_layers=cfg.get("num_layers", 2), epochs=cfg.get("epochs", 100),
+                    patience=cfg.get("patience", 10), dropout=cfg.get("dropout", 0.2),
                 )
                 m.fit(X_seq_tr, y_tr, X_val=X_seq_val, y_val=y_train[valid_idx])
                 pred_val = m.predict(X_seq_val)
@@ -533,25 +534,29 @@ def run_pipeline(
 
     for r in range(2, min(6, len(oof_dict) + 1)):
         for combo in combinations(oof_dict.keys(), r):
-            oofs = np.column_stack([oof_dict[m] for m in combo])
-            valid = np.all(np.isfinite(oofs), axis=1)
-            if valid.sum() < 20:
-                continue
-            meta = Ridge(alpha=1.0, random_state=RANDOM_STATE)
-            y_log = data[Y_TARGET_COL].values[valid] if Y_TARGET_COL in data.columns else data[TARGET_COL].values[valid]
-            meta.fit(oofs[valid], y_log)
-            oof_pred = meta.predict(oofs)
-            oof_pred_orig = np.expm1(oof_pred) if use_log else oof_pred
-            valid2 = np.isfinite(oof_pred_orig) & np.isfinite(y_orig)
-            if valid2.sum() < 20:
-                continue
-            mape_val = mape(y_orig[valid2], oof_pred_orig[valid2])
-            combo_name = "+".join(combo)
-            if mape_val < best_combo_mape:
-                best_combo_mape = mape_val
-                best_combo = list(combo)
-                best_combo_name = f"stacking({combo_name})"
-            logger.info("  앙상블 %s OOF MAPE: %.2f%%", combo_name, mape_val)
+            try:
+                oofs = np.column_stack([oof_dict[m] for m in combo])
+                valid = np.all(np.isfinite(oofs), axis=1)
+                if valid.sum() < 20:
+                    continue
+                meta = Ridge(alpha=1.0, random_state=RANDOM_STATE)
+                y_log = data[Y_TARGET_COL].values[valid] if Y_TARGET_COL in data.columns else data[TARGET_COL].values[valid]
+                meta.fit(oofs[valid], y_log)
+                oof_pred = np.full(len(oofs), np.nan)
+                oof_pred[valid] = meta.predict(oofs[valid])
+                oof_pred_orig = np.expm1(oof_pred) if use_log else oof_pred
+                valid2 = np.isfinite(oof_pred_orig) & np.isfinite(y_orig)
+                if valid2.sum() < 20:
+                    continue
+                mape_val = mape(y_orig[valid2], oof_pred_orig[valid2])
+                combo_name = "+".join(combo)
+                if mape_val < best_combo_mape:
+                    best_combo_mape = mape_val
+                    best_combo = list(combo)
+                    best_combo_name = f"stacking({combo_name})"
+                logger.info("  앙상블 %s OOF MAPE: %.2f%%", combo_name, mape_val)
+            except Exception as e:
+                logger.warning("  앙상블 %s 스킵: %s", "+".join(combo), str(e)[:60])
 
     use_stacking = best_combo is not None and len(best_combo) >= 2
     stacking_oofs = [oof_dict[m] for m in best_combo] if best_combo else []
@@ -596,9 +601,11 @@ def run_pipeline(
                     m = cb.CatBoostRegressor(**_cb_params(config, use_gpu))
                     m.fit(X_tr, y_tr)
                 except Exception as e:
-                    if use_gpu and ("gpu" in str(e).lower() or "cuda" in str(e).lower()):
+                    if use_gpu and ("gpu" in str(e).lower() or "cuda" in str(e).lower() or "device" in str(e).lower()):
                         m = cb.CatBoostRegressor(**_cb_params(config, False))
                         m.fit(X_tr, y_tr)
+                    else:
+                        raise
                 preds_tr.append(m.predict(X_tr))
                 preds_te.append(m.predict(X_te))
             elif mname == "elasticnet":
@@ -614,7 +621,7 @@ def run_pipeline(
                     cfg = config.get("lstm", {})
                     X_seq_tr = build_sequence_array(train_full, seq_cols)
                     X_seq_te = build_sequence_array(test_df, seq_cols)
-                    m = LSTMWrapper(seq_len=len(seq_cols), hidden=cfg.get("hidden", 64), layers=cfg.get("layers", 2), epochs=cfg.get("epochs", 50), patience=cfg.get("patience", 10))
+                    m = LSTMWrapper(seq_len=len(seq_cols), hidden=cfg.get("hidden", 64), layers=cfg.get("layers", 2), epochs=cfg.get("epochs", 100), patience=cfg.get("patience", 10), dropout=cfg.get("dropout", 0.2))
                     m.fit(X_seq_tr, y_tr.values)
                     preds_tr.append(m.predict(X_seq_tr))
                     preds_te.append(m.predict(X_seq_te))
@@ -625,116 +632,164 @@ def run_pipeline(
                     cfg = config.get("transformer", {})
                     X_seq_tr = build_sequence_array(train_full, seq_cols)
                     X_seq_te = build_sequence_array(test_df, seq_cols)
-                    m = TransformerWrapper(seq_len=len(seq_cols), d_model=cfg.get("d_model", 32), nhead=cfg.get("nhead", 4), num_layers=cfg.get("num_layers", 2), epochs=cfg.get("epochs", 50), patience=cfg.get("patience", 10))
+                    m = TransformerWrapper(seq_len=len(seq_cols), d_model=cfg.get("d_model", 32), nhead=cfg.get("nhead", 4), num_layers=cfg.get("num_layers", 2), epochs=cfg.get("epochs", 100), patience=cfg.get("patience", 10), dropout=cfg.get("dropout", 0.2))
                     m.fit(X_seq_tr, y_tr.values)
                     preds_tr.append(m.predict(X_seq_tr))
                     preds_te.append(m.predict(X_seq_te))
         if len(preds_tr) >= 2:
-            meta = Ridge(alpha=1.0, random_state=RANDOM_STATE)
-            meta.fit(np.column_stack(preds_tr), y_tr)
-            pred = meta.predict(np.column_stack(preds_te))
-            best_name = best_combo_name
-            logger.info("Stacking %s (%d models→Ridge) 적용", best_combo_name, len(preds_tr))
+            try:
+                oof_tr = np.column_stack(preds_tr)
+                oof_te = np.column_stack(preds_te)
+                valid_tr = np.all(np.isfinite(oof_tr), axis=1)
+                if valid_tr.sum() < 20:
+                    raise ValueError("Stacking: 유효한 train 샘플 부족")
+                meta = Ridge(alpha=1.0, random_state=RANDOM_STATE)
+                meta.fit(oof_tr[valid_tr], y_tr.values[valid_tr])
+                valid_te_stk = np.all(np.isfinite(oof_te), axis=1)
+                pred = np.full(len(oof_te), np.nan)
+                if valid_te_stk.sum() > 0:
+                    pred[valid_te_stk] = meta.predict(oof_te[valid_te_stk])
+                best_name = best_combo_name
+                logger.info("Stacking %s (%d models→Ridge) 적용", best_combo_name, len(preds_tr))
+            except Exception as e:
+                logger.warning("Stacking 실패, 단일 모델 사용: %s", str(e)[:80])
+                use_stacking = False
+                best_name = best_single
+                pred = None
         else:
             use_stacking = False
-    elif best_name == "lgb":
-        import lightgbm as lgb
-        from feature_selection.device_utils import fit_lgb_with_fallback
-        final_model = lgb.LGBMRegressor(**_lgb_params(config, use_gpu))
-        final_model = fit_lgb_with_fallback(final_model, X_tr, y_tr, "gpu" if use_gpu else "cpu")
-        pred = final_model.predict(X_te) if valid_te.sum() > 0 else None
-    elif best_name == "catboost":
-        import catboost as cb
-        try:
-            final_model = cb.CatBoostRegressor(**_cb_params(config, use_gpu))
-            final_model.fit(X_tr, y_tr)
-        except Exception as e:
-            if use_gpu and ("gpu" in str(e).lower() or "cuda" in str(e).lower() or "device" in str(e).lower()):
-                logger.warning("CatBoost GPU 실패, CPU fallback")
-                final_model = cb.CatBoostRegressor(**_cb_params(config, False))
+
+    if pred is None and best_name:
+        # Stacking 실패 시 또는 단일 모델 경로
+        if best_name == "lgb":
+            import lightgbm as lgb
+            from feature_selection.device_utils import fit_lgb_with_fallback
+            final_model = lgb.LGBMRegressor(**_lgb_params(config, use_gpu))
+            final_model = fit_lgb_with_fallback(final_model, X_tr, y_tr, "gpu" if use_gpu else "cpu")
+            pred = final_model.predict(X_te) if valid_te.sum() > 0 else None
+        elif best_name == "catboost":
+            import catboost as cb
+            try:
+                final_model = cb.CatBoostRegressor(**_cb_params(config, use_gpu))
                 final_model.fit(X_tr, y_tr)
+            except Exception as e:
+                if use_gpu and ("gpu" in str(e).lower() or "cuda" in str(e).lower() or "device" in str(e).lower()):
+                    logger.warning("CatBoost GPU 실패, CPU fallback")
+                    final_model = cb.CatBoostRegressor(**_cb_params(config, False))
+                    final_model.fit(X_tr, y_tr)
+                else:
+                    raise
+            pred = final_model.predict(X_te) if valid_te.sum() > 0 else None
+        elif best_name == "elasticnet":
+            from sklearn.linear_model import ElasticNet
+            final_model = ElasticNet(alpha=0.1, l1_ratio=0.5, random_state=RANDOM_STATE)
+            final_model.fit(X_tr, y_tr)
+            pred = final_model.predict(X_te) if valid_te.sum() > 0 else None
+        elif best_name == "lstm":
+            from training.deep_models import LSTMWrapper, _get_lag_sequence_cols, build_sequence_array
+            seq_cols = _get_lag_sequence_cols(features, max_lag=config.get("lstm", {}).get("seq_len", 365))
+            if len(seq_cols) >= 2:
+                cfg = config.get("lstm", {})
+                X_seq_tr = build_sequence_array(train_full, seq_cols)
+                X_seq_te = build_sequence_array(test_df, seq_cols)
+                n = len(X_seq_tr)
+                if n > 100:
+                    split = int(n * 0.8)
+                    X_tr_sub, X_val_sub = X_seq_tr[:split], X_seq_tr[split:]
+                    y_tr_sub, y_val_sub = y_tr.values[:split], y_tr.values[split:]
+                    final_model = LSTMWrapper(seq_len=len(seq_cols), hidden=cfg.get("hidden", 64), layers=cfg.get("layers", 2), epochs=cfg.get("epochs", 100), patience=cfg.get("patience", 10), dropout=cfg.get("dropout", 0.2))
+                    final_model.fit(X_tr_sub, y_tr_sub, X_val=X_val_sub, y_val=y_val_sub)
+                else:
+                    final_model = LSTMWrapper(seq_len=len(seq_cols), hidden=cfg.get("hidden", 64), layers=cfg.get("layers", 2), epochs=cfg.get("epochs", 100), dropout=cfg.get("dropout", 0.2))
+                    final_model.fit(X_seq_tr, y_tr.values)
+                pred = final_model.predict(X_seq_te) if valid_te.sum() > 0 else None
             else:
-                raise
-        pred = final_model.predict(X_te) if valid_te.sum() > 0 else None
-    elif best_name == "elasticnet":
-        from sklearn.linear_model import ElasticNet
-        final_model = ElasticNet(alpha=0.1, l1_ratio=0.5, random_state=RANDOM_STATE)
-        final_model.fit(X_tr, y_tr)
-        pred = final_model.predict(X_te) if valid_te.sum() > 0 else None
-    elif best_name == "lstm":
-        from training.deep_models import LSTMWrapper, _get_lag_sequence_cols, build_sequence_array
-        seq_cols = _get_lag_sequence_cols(features, max_lag=config.get("lstm", {}).get("seq_len", 365))
-        if len(seq_cols) >= 2:
-            cfg = config.get("lstm", {})
-            X_seq_tr = build_sequence_array(train_full, seq_cols)
-            X_seq_te = build_sequence_array(test_df, seq_cols)
-            n = len(X_seq_tr)
-            if n > 100:
-                split = int(n * 0.8)
-                X_tr_sub, X_val_sub = X_seq_tr[:split], X_seq_tr[split:]
-                y_tr_sub, y_val_sub = y_tr.values[:split], y_tr.values[split:]
-                final_model = LSTMWrapper(seq_len=len(seq_cols), hidden=cfg.get("hidden", 64), layers=cfg.get("layers", 2), epochs=cfg.get("epochs", 100), patience=cfg.get("patience", 10))
-                final_model.fit(X_tr_sub, y_tr_sub, X_val=X_val_sub, y_val=y_val_sub)
+                pred = None
+        elif best_name == "transformer":
+            from training.deep_models import TransformerWrapper, _get_lag_sequence_cols, build_sequence_array
+            seq_cols = _get_lag_sequence_cols(features, max_lag=config.get("transformer", {}).get("seq_len", 365))
+            if len(seq_cols) >= 2:
+                cfg = config.get("transformer", {})
+                X_seq_tr = build_sequence_array(train_full, seq_cols)
+                X_seq_te = build_sequence_array(test_df, seq_cols)
+                n = len(X_seq_tr)
+                if n > 100:
+                    split = int(n * 0.8)
+                    X_tr_sub, X_val_sub = X_seq_tr[:split], X_seq_tr[split:]
+                    y_tr_sub, y_val_sub = y_tr.values[:split], y_tr.values[split:]
+                    final_model = TransformerWrapper(seq_len=len(seq_cols), d_model=cfg.get("d_model", 32), nhead=cfg.get("nhead", 4), num_layers=cfg.get("num_layers", 2), epochs=cfg.get("epochs", 100), patience=cfg.get("patience", 10), dropout=cfg.get("dropout", 0.2))
+                    final_model.fit(X_tr_sub, y_tr_sub, X_val=X_val_sub, y_val=y_val_sub)
+                else:
+                    final_model = TransformerWrapper(seq_len=len(seq_cols), d_model=cfg.get("d_model", 32), nhead=cfg.get("nhead", 4), num_layers=cfg.get("num_layers", 2), epochs=cfg.get("epochs", 100), dropout=cfg.get("dropout", 0.2))
+                    final_model.fit(X_seq_tr, y_tr.values)
+                pred = final_model.predict(X_seq_te) if valid_te.sum() > 0 else None
             else:
-                final_model = LSTMWrapper(seq_len=len(seq_cols), hidden=cfg.get("hidden", 64), layers=cfg.get("layers", 2), epochs=cfg.get("epochs", 100))
-                final_model.fit(X_seq_tr, y_tr.values)
-            pred = final_model.predict(X_seq_te) if valid_te.sum() > 0 else None
-        else:
-            pred = None
-    elif best_name == "transformer":
-        from training.deep_models import TransformerWrapper, _get_lag_sequence_cols, build_sequence_array
-        seq_cols = _get_lag_sequence_cols(features, max_lag=config.get("transformer", {}).get("seq_len", 365))
-        if len(seq_cols) >= 2:
-            cfg = config.get("transformer", {})
-            X_seq_tr = build_sequence_array(train_full, seq_cols)
-            X_seq_te = build_sequence_array(test_df, seq_cols)
-            n = len(X_seq_tr)
-            if n > 100:
-                split = int(n * 0.8)
-                X_tr_sub, X_val_sub = X_seq_tr[:split], X_seq_tr[split:]
-                y_tr_sub, y_val_sub = y_tr.values[:split], y_tr.values[split:]
-                final_model = TransformerWrapper(seq_len=len(seq_cols), d_model=cfg.get("d_model", 32), nhead=cfg.get("nhead", 4), num_layers=cfg.get("num_layers", 2), epochs=cfg.get("epochs", 100), patience=cfg.get("patience", 10))
-                final_model.fit(X_tr_sub, y_tr_sub, X_val=X_val_sub, y_val=y_val_sub)
-            else:
-                final_model = TransformerWrapper(seq_len=len(seq_cols), d_model=cfg.get("d_model", 32), nhead=cfg.get("nhead", 4), num_layers=cfg.get("num_layers", 2), epochs=cfg.get("epochs", 100))
-                final_model.fit(X_seq_tr, y_tr.values)
-            pred = final_model.predict(X_seq_te) if valid_te.sum() > 0 else None
-        else:
-            pred = None
+                pred = None
 
     if pred is not None and valid_te.sum() > 0:
         pred_orig = np.expm1(pred) if use_log else pred
-        from training.metrics import compute_all_metrics
-        lag1_col = "price_per_kg_mean_lag1"
-        y_naive = None
-        if lag1_col in test_df.columns:
-            nv = test_df[lag1_col].values[valid_te]
-            if np.isfinite(nv).all():
-                y_naive = nv
-        metrics = compute_all_metrics(y_te[valid_te], pred_orig[valid_te], y_naive=y_naive)
-        results["test_metrics"] = metrics
-        results["test_mape"] = metrics["mape"]
-        for k, v in metrics.items():
-            logger.info("Test %s: %.4f", k, v)
-        if "mape_log" in metrics:
-            logger.info("Test MAPE (log scale): %.4f%%", metrics["mape_log"])
+        valid_pred = np.isfinite(pred_orig)
+        valid_final = valid_te & valid_pred
+        if valid_final.sum() < 5:
+            logger.warning("유효한 예측 샘플 부족 (%d), 메트릭 스킵", valid_final.sum())
+        else:
+            from training.metrics import compute_all_metrics
+            lag1_col = "price_per_kg_mean_lag1"
+            y_naive = None
+            if lag1_col in test_df.columns:
+                nv = test_df[lag1_col].values[valid_final]
+                if np.isfinite(nv).all():
+                    y_naive = nv
+            metrics = compute_all_metrics(y_te[valid_final], pred_orig[valid_final], y_naive=y_naive)
+            results["test_metrics"] = metrics
+            results["test_mape"] = metrics["mape"]
+            for k, v in metrics.items():
+                logger.info("Test %s: %.4f", k, v)
+            if "mape_log" in metrics:
+                logger.info("Test MAPE (log scale): %.4f%%", metrics["mape_log"])
 
-        # Per-season MAPE
-        test_df = test_df.copy()
-        test_df["_pred"] = pred_orig
-        test_df["_month"] = pd.to_datetime(test_df["date"].astype(str), format="%Y%m%d").dt.month
-        test_df["_season"] = test_df["_month"].apply(_month_to_season)
-        season_mape = {}
-        for s in SEASON_MONTHS:
-            mask = (test_df["_season"] == s) & test_df[TARGET_COL].notna() & np.isfinite(test_df["_pred"])
-            if mask.sum() > 0:
-                season_mape[s] = mape(
-                    test_df.loc[mask, TARGET_COL].values,
-                    test_df.loc[mask, "_pred"].values,
-                )
-        results["season_mape"] = season_mape
-        for s, m in season_mape.items():
-            logger.info("  %s MAPE: %.2f%%", s, m)
+            # Per-season MAPE
+            test_df = test_df.copy()
+            test_df["_pred"] = pred_orig
+            test_df["_month"] = pd.to_datetime(test_df["date"].astype(str), format="%Y%m%d").dt.month
+            test_df["_season"] = test_df["_month"].apply(_month_to_season)
+            season_mape = {}
+            for s in SEASON_MONTHS:
+                mask = (test_df["_season"] == s) & test_df[TARGET_COL].notna() & np.isfinite(test_df["_pred"])
+                if mask.sum() > 0:
+                    season_mape[s] = mape(
+                        test_df.loc[mask, TARGET_COL].values,
+                        test_df.loc[mask, "_pred"].values,
+                    )
+            results["season_mape"] = season_mape
+            for s, m in season_mape.items():
+                logger.info("  %s MAPE: %.2f%%", s, m)
+
+            # 계절별 예측 사례 ~10개 (날짜, 실제가격, 예측가격)
+            examples = []
+            n_per_season = max(2, 10 // len(SEASON_MONTHS))
+            for s in SEASON_MONTHS:
+                mask = (test_df["_season"] == s) & test_df[TARGET_COL].notna() & np.isfinite(test_df["_pred"])
+                sub = test_df.loc[mask, ["date", TARGET_COL, "_pred"]].drop_duplicates("date")
+                if len(sub) == 0:
+                    continue
+                n_take = min(n_per_season, len(sub))
+                sampled = sub.sample(n=n_take, random_state=RANDOM_STATE)
+                for _, row in sampled.iterrows():
+                    d = str(int(row["date"]))
+                    date_str = f"{d[:4]}-{d[4:6]}-{d[6:8]}" if len(d) >= 8 else d
+                    examples.append({
+                        "date": date_str,
+                        "season": s,
+                        "actual": float(row[TARGET_COL]),
+                        "predicted": float(row["_pred"]),
+                    })
+            examples = sorted(examples, key=lambda x: (list(SEASON_MONTHS).index(x["season"]), x["date"]))[:10]
+            results["prediction_examples"] = examples
+            logger.info("Test 예측 사례 (계절별):")
+            for ex in examples:
+                err = abs(ex["actual"] - ex["predicted"]) / (ex["actual"] + 1e-8) * 100
+                logger.info("  %s %s | 실제 %.0f원/kg → 예측 %.0f원/kg (오차 %.1f%%)", ex["date"], ex["season"], ex["actual"], ex["predicted"], err)
 
     results["best_model"] = best_name
     results["use_stacking"] = use_stacking
@@ -798,6 +853,18 @@ def run_pipeline(
     ])
     for s, m in results.get("season_mape", {}).items():
         lines.append(f"| {s} | {m:.2f} |")
+    ex_list = results.get("prediction_examples", [])
+    lines.extend([
+        "",
+        "## Test 예측 사례 (계절별)",
+        "| 날짜 | 계절 | 실제가격(원/kg) | 예측가격(원/kg) | 오차(%) |",
+        "|------|------|----------------|----------------|---------|",
+    ])
+    for ex in ex_list:
+        err = abs(ex["actual"] - ex["predicted"]) / (ex["actual"] + 1e-8) * 100
+        lines.append(f"| {ex['date']} | {ex['season']} | {ex['actual']:,.0f} | {ex['predicted']:,.0f} | {err:.1f}% |")
+    if not ex_list:
+        lines.append("| *(유효한 예측 없음)* | | | | |")
     report_path.write_text("\n".join(lines), encoding="utf-8")
     logger.info("Report: %s", report_path)
 

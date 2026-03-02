@@ -52,7 +52,7 @@ baseline:
 
 # LightGBM (Primary)
 lgb:
-  n_estimators: 500
+  n_estimators: 800
   num_leaves: [15, 31, 63]
   max_depth: [3, 5, 6, 8]
   min_data_in_leaf: [20, 40, 80]
@@ -64,7 +64,7 @@ lgb:
 
 # CatBoost (Secondary)
 catboost:
-  iterations: 500
+  iterations: 800
   depth: [4, 6, 8]
   n_trials: 20
 
@@ -83,14 +83,15 @@ stacking:
   meta_model: "ridge"
   include_lstm: false              # true면 LSTM OOF도 stacking에 포함 (다양한 앙상블)
 
-# Deep 모델 (LSTM, Transformer) - eval, early stopping, checkpoint
+# Deep 모델 (LSTM, Transformer) - eval, early stopping, checkpoint, dropout
 lstm:
   enabled: true
   seq_len: 365
   hidden: 64
   layers: 2
-  epochs: 100
-  patience: 10
+  epochs: 150
+  patience: 15
+  dropout: 0.3
 
 transformer:
   enabled: true
@@ -98,5 +99,6 @@ transformer:
   d_model: 32
   nhead: 4
   num_layers: 2
-  epochs: 100
-  patience: 10
+  epochs: 150
+  patience: 15
+  dropout: 0.3

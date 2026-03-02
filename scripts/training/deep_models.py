@@ -62,6 +62,7 @@ class LSTMWrapper:
         epochs: int = 50,
         lr: float = 0.001,
         patience: int = 10,
+        dropout: float = 0.2,
         checkpoint_dir: Optional[Path] = None,
     ):
         self.seq_len = seq_len
@@ -70,6 +71,7 @@ class LSTMWrapper:
         self.epochs = epochs
         self.lr = lr
         self.patience = patience
+        self.dropout = dropout
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else CHECKPOINT_DIR
         self.model = None
         self.seq_cols = None
@@ -91,16 +93,18 @@ class LSTMWrapper:
         import torch.nn as nn
 
         class LSTMReg(nn.Module):
-            def __init__(self, seq_len, hidden, layers):
+            def __init__(self, seq_len, hidden, layers, dropout=0.2):
                 super().__init__()
-                self.lstm = nn.LSTM(1, hidden, layers, batch_first=True)
+                self.lstm = nn.LSTM(1, hidden, layers, batch_first=True, dropout=dropout if layers > 1 else 0)
+                self.dropout = nn.Dropout(dropout)
                 self.fc = nn.Linear(hidden, 1)
 
             def forward(self, x):
                 out, _ = self.lstm(x)
-                return self.fc(out[:, -1, :]).squeeze(-1)
+                h = self.dropout(out[:, -1, :])
+                return self.fc(h).squeeze(-1)
 
-        self.model = LSTMReg(self.seq_len, self.hidden, self.layers)
+        self.model = LSTMReg(self.seq_len, self.hidden, self.layers, dropout=self.dropout)
         opt = torch.optim.Adam(self.model.parameters(), lr=self.lr)
         X_t = torch.FloatTensor(X_seq)
         y_t = torch.FloatTensor(y)
@@ -183,6 +187,7 @@ class TransformerWrapper:
         epochs: int = 50,
         lr: float = 0.001,
         patience: int = 10,
+        dropout: float = 0.2,
         checkpoint_dir: Optional[Path] = None,
     ):
         self.seq_len = seq_len
@@ -192,6 +197,7 @@ class TransformerWrapper:
         self.epochs = epochs
         self.lr = lr
         self.patience = patience
+        self.dropout = dropout
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else CHECKPOINT_DIR
         self.model = None
         self.best_epoch = 0
@@ -226,21 +232,23 @@ class TransformerWrapper:
                 return x + self.pe[:, : x.size(1)]
 
         class TransReg(nn.Module):
-            def __init__(self, seq_len, d_model, nhead, num_layers):
+            def __init__(self, seq_len, d_model, nhead, num_layers, dropout=0.2):
                 super().__init__()
                 self.proj = nn.Linear(1, d_model)
                 self.pos = PosEnc(seq_len, d_model)
-                enc = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward=d_model * 4, batch_first=True)
+                enc = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward=d_model * 4, dropout=dropout, batch_first=True)
                 self.trans = nn.TransformerEncoder(enc, num_layers)
+                self.dropout = nn.Dropout(dropout)
                 self.fc = nn.Linear(d_model, 1)
 
             def forward(self, x):
                 x = self.proj(x)
                 x = self.pos(x)
                 x = self.trans(x)
-                return self.fc(x[:, -1, :]).squeeze(-1)
+                h = self.dropout(x[:, -1, :])
+                return self.fc(h).squeeze(-1)
 
-        self.model = TransReg(self.seq_len, self.d_model, self.nhead, self.num_layers)
+        self.model = TransReg(self.seq_len, self.d_model, self.nhead, self.num_layers, dropout=self.dropout)
         opt = torch.optim.Adam(self.model.parameters(), lr=self.lr)
         X_t = torch.FloatTensor(X_seq)
         y_t = torch.FloatTensor(y)
