@@ -75,6 +75,23 @@ python scripts/run_training_pipeline.py --skip-shap --plot
 
 ---
 
+## 5. 카테고리컬 보정 실험
+
+mean vs median, domae 가락도매 필터, 저거래건수 처리(exclude vs fill_week) 등 조합 실험:
+
+```bash
+python scripts/run_categorical_merge_experiments.py
+```
+
+옵션:
+- `--analyze-only`: 카테고리컬 컬럼 분석만 (보고서: reports/categorical_analysis_report.md)
+- `--skip-training`: merge만 수행, 학습 스킵
+- `--exp exp_0 exp_1`: 특정 실험만 실행
+
+출력: reports/categorical_experiments_report.md, reports/categorical_experiments_comparison.png
+
+---
+
 ## 전체 파이프라인 (순서)
 
 ```bash

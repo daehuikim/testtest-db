@@ -1,0 +1,245 @@
+{
+  "auction": {
+    "도매시장": {
+      "dtype": "object",
+      "n_unique": 1,
+      "sample_values": [
+        "서울가락"
+      ]
+    },
+    "법인": {
+      "dtype": "object",
+      "n_unique": 4,
+      "sample_values": [
+        "서울청과㈜",
+        "동화청과㈜",
+        "㈜중앙청과",
+        "한국청과㈜"
+      ]
+    },
+    "부류": {
+      "dtype": "object",
+      "n_unique": 1,
+      "sample_values": [
+        "과실류"
+      ]
+    },
+    "품목": {
+      "dtype": "object",
+      "n_unique": 1,
+      "sample_values": [
+        "사과"
+      ]
+    },
+    "품종": {
+      "dtype": "object",
+      "n_unique": 6,
+      "sample_values": [
+        "기타",
+        "후지",
+        "미시마",
+        "미야비",
+        "미얀마",
+        "로얄부사"
+      ]
+    },
+    "출하지": {
+      "dtype": "object",
+      "n_unique": 23,
+      "sample_values": [
+        "-",
+        "경상북도 안동시",
+        "충청북도 충주시",
+        "전북특별자치도 무주군",
+        "경상북도 영천시",
+        "경상북도 예천군",
+        "경상북도 의성군",
+        "경상북도 청송군",
+        "경상북도 영주시",
+        "대구광역시"
+      ]
+    },
+    "단량": {
+      "dtype": "object",
+      "n_unique": 10,
+      "sample_values": [
+        "10kg 파렛트",
+        "10kg 상자",
+        "18kg P-BOX",
+        "2.5kg 상자",
+        "4.5kg 상자",
+        "2kg 상자",
+        "3kg 상자",
+        "5kg 파렛트",
+        "5kg 상자",
+        "6kg 상자"
+      ]
+    },
+    "거래일자": {
+      "dtype": "object",
+      "n_unique": 18,
+      "sample_values": [
+        "2020-02-29",
+        "2020-03-07",
+        "2020-03-14",
+        "2020-02-25",
+        "2020-02-26",
+        "2020-02-27",
+        "2020-02-28",
+        "2020-03-21",
+        "2020-03-11",
+        "2020-03-04"
+      ]
+    },
+    "매매구분": {
+      "dtype": "object",
+      "n_unique": 3,
+      "sample_values": [
+        "정가수의",
+        "경매",
+        "전자거래"
+      ]
+    }
+  },
+  "domae": {
+    "FRMPRD_CATGORY_NM": {
+      "dtype": "object",
+      "n_unique": 1,
+      "sample_values": [
+        "과일류"
+      ]
+    },
+    "PRDLST_NM": {
+      "dtype": "object",
+      "n_unique": 1,
+      "sample_values": [
+        "사과"
+      ]
+    },
+    "SPCIES_NM": {
+      "dtype": "object",
+      "n_unique": 3,
+      "sample_values": [
+        "후지",
+        "쓰가루(아오리)",
+        "홍로"
+      ]
+    },
+    "GRAD_NM": {
+      "dtype": "object",
+      "n_unique": 2,
+      "sample_values": [
+        "상품",
+        "중품"
+      ]
+    },
+    "EXAMIN_UNIT": {
+      "dtype": "object",
+      "n_unique": 1,
+      "sample_values": [
+        "10kg"
+      ]
+    },
+    "AREA_NM": {
+      "dtype": "object",
+      "n_unique": 5,
+      "sample_values": [
+        "서울",
+        "부산",
+        "대구",
+        "광주",
+        "대전"
+      ]
+    },
+    "MRKT_NM": {
+      "dtype": "object",
+      "n_unique": 6,
+      "sample_values": [
+        "가락도매",
+        "엄궁도매",
+        "북부도매",
+        "서부도매",
+        "오정도매",
+        "남포동건어물"
+      ]
+    },
+    "MRKT_NM_counts": {
+      "오정도매": 794,
+      "서부도매": 789,
+      "북부도매": 786,
+      "엄궁도매": 785,
+      "가락도매": 783,
+      "남포동건어물": 2
+    }
+  },
+  "somae": {
+    "FRMPRD_CATGORY_NM": {
+      "dtype": "object",
+      "n_unique": 1,
+      "sample_values": [
+        "과일류"
+      ]
+    },
+    "PRDLST_NM": {
+      "dtype": "object",
+      "n_unique": 1,
+      "sample_values": [
+        "사과"
+      ]
+    },
+    "SPCIES_NM": {
+      "dtype": "object",
+      "n_unique": 1,
+      "sample_values": [
+        "후지"
+      ]
+    },
+    "GRAD_NM": {
+      "dtype": "object",
+      "n_unique": 2,
+      "sample_values": [
+        "상품",
+        "중품"
+      ]
+    },
+    "EXAMIN_UNIT": {
+      "dtype": "object",
+      "n_unique": 1,
+      "sample_values": [
+        "10개"
+      ]
+    },
+    "AREA_NM": {
+      "dtype": "object",
+      "n_unique": 19,
+      "sample_values": [
+        "대전",
+        "대구",
+        "부산",
+        "수원",
+        "서울",
+        "광주",
+        "울산",
+        "강릉",
+        "포항",
+        "전주"
+      ]
+    },
+    "MRKT_NM": {
+      "dtype": "object",
+      "n_unique": 22,
+      "sample_values": [
+        "역전",
+        "동구",
+        "A-유통",
+        "B-유통",
+        "영등포",
+        "양동",
+        "신정",
+        "중앙",
+        "C-유통",
+        "E-유통"
+      ]
+    }
+  }
+}
