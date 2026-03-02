@@ -16,9 +16,12 @@ def expanding_walk_fold_indices(
     df: pd.DataFrame,
     date_col: str = "date",
     n_folds: int = 5,
+    n_splits: Optional[int] = None,  # n_folds와 동일 (호환용)
     valid_days: int = 30,
 ) -> Generator[Tuple[np.ndarray, np.ndarray], None, None]:
     """Expanding window: train 누적, valid 30일 고정."""
+    if n_splits is not None:
+        n_folds = n_splits
     df = df.copy()
     df = df.sort_values(date_col).reset_index(drop=True)
     df["_dt"] = pd.to_datetime(df[date_col].astype(str), format="%Y%m%d", errors="coerce")
@@ -51,8 +54,12 @@ def timeseries_split_indices(
     df: pd.DataFrame,
     date_col: str = "date",
     n_splits: int = 5,
+    n_folds: Optional[int] = None,  # n_splits와 동일 (호환용)
+    **kwargs,  # valid_days 등 무시
 ) -> Generator[Tuple[np.ndarray, np.ndarray], None, None]:
     """sklearn TimeSeriesSplit 스타일: expanding window."""
+    if n_folds is not None:
+        n_splits = n_folds
     df = df.copy()
     df = df.sort_values(date_col).reset_index(drop=True)
     n = len(df)
@@ -76,6 +83,7 @@ def purged_group_timeseries_indices(
     df: pd.DataFrame,
     date_col: str = "date",
     n_splits: int = 5,
+    n_folds: Optional[int] = None,  # n_splits와 동일 (호환용, 무시됨)
     valid_days: int = 30,
     purge_days: int = 7,
     embargo_days: int = 3,
@@ -85,6 +93,8 @@ def purged_group_timeseries_indices(
     - purge: valid 구간과 겹치는 train 샘플 제거
     - embargo: valid 직전 embargo_days도 train에서 제외 (leakage 방지)
     """
+    if n_folds is not None:
+        n_splits = n_folds
     df = df.copy()
     df = df.sort_values(date_col).reset_index(drop=True)
     df["_dt"] = pd.to_datetime(df[date_col].astype(str), format="%Y%m%d", errors="coerce")

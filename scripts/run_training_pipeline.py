@@ -441,7 +441,7 @@ def run_pipeline(
 
     # Baseline
     baseline_results = run_baselines(train_df, test_df, features)
-    results = {"baseline": baseline_results}
+    results["baseline"] = baseline_results
 
     # Lag clustering: base별 대표 lag 1개 (94개 → ~40개 수준)
     use_gpu = config.get("use_gpu", False)
@@ -689,7 +689,7 @@ def run_pipeline(
         "# Training Pipeline Report",
         "",
         "## 예측 품종",
-        f"**{results.get('variety', '-')}** (최다 품종만 학습/예측)",
+        f"**{results.get('variety', '-')}**",
         "",
         "### 품종별 샘플 수 (학습에 사용된 품종)",
         "| 품종 | 샘플 수 |",
@@ -704,7 +704,7 @@ def run_pipeline(
         "## Baseline",
         "| Model | MAPE (%) |",
         "|-------|----------|",
-    ]
+    ])
     for k, v in baseline_results.items():
         lines.append(f"| {k} | {v:.2f} |")
     lines.extend([
