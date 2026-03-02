@@ -15,8 +15,11 @@ Stage 5: 공통 feature (품종 리스트업 → 모든 품종에서 중요한 f
 import argparse
 import json
 import logging
+import re
 import sys
 from pathlib import Path
+
+import pandas as pd
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
@@ -147,9 +150,33 @@ def run_pipeline(
             logger.warning("Stage 6 (Lag clustering) 스킵: %s", str(e)[:50])
     final_features = sorted(features)
 
+    # 최종 feature importance (LGBM) - 순위/점수/설명용
+    feature_importance = {}
+    try:
+        import lightgbm as lgb
+        from feature_selection.device_utils import fit_lgb_with_fallback
+        data = df[df["price_per_kg_mean"].notna()].fillna(df.median(numeric_only=True))
+        X = data[[f for f in final_features if f in data.columns]]
+        y = data["price_per_kg_mean"]
+        if len(X) > 50 and len(X.columns) > 0:
+            m = lgb.LGBMRegressor(n_estimators=100, max_depth=5, verbosity=-1, random_state=42, device="gpu" if config.get("use_gpu") else "cpu")
+            m = fit_lgb_with_fallback(m, X, y, "gpu" if config.get("use_gpu") else "cpu")
+            imp = pd.Series(m.feature_importances_, index=X.columns)
+            imp = (imp / imp.sum() * 100).round(2)  # 비율 %
+            feature_importance = imp.to_dict()
+    except Exception as e:
+        logger.warning("Feature importance 계산 스킵: %s", str(e)[:50])
+
+    # 품종별 비율
+    variety_counts = df["품종"].value_counts()
+    variety_ratios = (variety_counts / len(df) * 100).round(1).to_dict()
+    representative = config.get("representative_varieties") or []
+
     # 리포트 저장
     report = {
         "varieties": varieties,
+        "variety_ratios": variety_ratios,
+        "representative_varieties": representative,
         "n_varieties": len(varieties),
         "stage0_features": len(all_features),
         "stage1_kept": len(s1) if s1 else 0,
@@ -159,6 +186,7 @@ def run_pipeline(
         "stage5_kept": s5_count,
         "stage6_kept": len(final_features),
         "final_features": final_features,
+        "feature_importance": feature_importance,
         "n_final": len(final_features),
     }
     report_path = output_dir / "feature_selection_pipeline_report.json"
@@ -166,29 +194,92 @@ def run_pipeline(
         json.dump(report, f, ensure_ascii=False, indent=2)
     logger.info("리포트: %s", report_path)
 
+    # feature_metadata 로드 (description)
+    meta_path = PROJECT_ROOT / "config" / "feature_metadata.json"
+    meta = {}
+    if meta_path.exists():
+        with open(meta_path, encoding="utf-8") as f:
+            meta = json.load(f)
+
+    def get_description(fname: str) -> str:
+        if fname in meta:
+            return meta[fname]
+        m = re.match(r"^(.+)_lag(\d+)$", fname)
+        if m:
+            base, lag = m.group(1), m.group(2)
+            base_key = f"{base}_lag1"
+            if base_key in meta:
+                return meta[base_key].replace("1일", f"{lag}일")
+            if base in meta:
+                return f"{lag}일 전 " + meta[base]
+            if "domae" in base:
+                return f"{lag}일 전 도매 관련"
+            if "somae" in base:
+                return f"{lag}일 전 소매 관련"
+            if "weather" in base:
+                return f"{lag}일 전 기상"
+            return f"{lag}일 전 {base}"
+        m = re.match(r"^(.+)_rolling(\d+)$", fname)
+        if m:
+            base, w = m.group(1), m.group(2)
+            base_desc = meta.get(base, base)
+            return f"{base_desc} ({w}일 rolling)"
+        return meta.get(fname, fname)
+
     # Markdown 요약
+    stage_descriptions = {
+        0: "Maximal lag 생성 (target/도매/소매/날씨 lag + rolling)",
+        1: "CCF + MI pre-filter (상관·상호정보 상위만)",
+        2: "Elastic Net (TimeSeriesSplit, L1/L2 정규화)",
+        3: "Rolling Permutation Importance (시간창별 안정성)",
+        4: "Temporal stability (연도별 rank correlation)",
+        5: "Common (품종별 중요도 → 모든 품종에서 중요한 feature만)",
+        6: "Lag + Auction cluster (base별 대표 lag 1개, auction_* 상위 2개)",
+    }
     md_lines = [
         "# Feature Selection Pipeline 결과",
         "",
         "## 품종 (공통 feature 적용)",
         ", ".join(varieties[:20]) + (" ..." if len(varieties) > 20 else ""),
         "",
+        "## 품종별 비율 (%)",
+        "| 품종 | 비율 |",
+        "|------|------|",
+    ]
+    for v, pct in list(variety_ratios.items())[:15]:
+        md_lines.append(f"| {v} | {pct}% |")
+    if len(variety_ratios) > 15:
+        md_lines.append(f"| ... | ({len(variety_ratios)}개 품종) |")
+    md_lines.extend([
+        "",
+        "## 대표 품종 (학습용)",
+        ", ".join(representative) if representative else "(미설정)",
+        "",
         "## Stage별 감소",
-        "| Stage | 유지 feature 수 |",
-        "|-------|----------------|",
-        f"| 0 (Maximal lag) | {len(all_features)} |",
-        f"| 1 (CCF+MI) | {len(s1) if s1 else '-'} |",
-        f"| 2 (Elastic Net) | {len(s2) if s2 else '-'} |",
-        f"| 3 (Rolling Perm) | {len(s3) if s3 else '-'} |",
-        f"| 4 (Stability) | {len(s4) if s4 else '-'} |",
-        f"| 5 (Common) | {s5_count} |",
-        f"| 6 (Lag cluster) | {len(final_features)} |",
+        "| Stage | 유지 feature 수 | 설명 |",
+        "|-------|----------------|------|",
+    ])
+    md_lines.append(f"| 0 (Maximal lag) | {len(all_features)} | {stage_descriptions[0]} |")
+    md_lines.append(f"| 1 (CCF+MI) | {len(s1) if s1 else '-'} | {stage_descriptions[1]} |")
+    md_lines.append(f"| 2 (Elastic Net) | {len(s2) if s2 else '-'} | {stage_descriptions[2]} |")
+    md_lines.append(f"| 3 (Rolling Perm) | {len(s3) if s3 else '-'} | {stage_descriptions[3]} |")
+    md_lines.append(f"| 4 (Stability) | {len(s4) if s4 else '-'} | {stage_descriptions[4]} |")
+    md_lines.append(f"| 5 (Common) | {s5_count} | {stage_descriptions[5]} |")
+    md_lines.append(f"| 6 (Lag cluster) | {len(final_features)} | {stage_descriptions[6]} |")
+    md_lines.extend([
         "",
         "## 최종 Feature Set",
         "",
-    ]
+        "순위는 Stage 6 Lag clustering 후 LGBM feature importance 기준 (높을수록 중요).",
+        "",
+        "| 순위 | Feature | 설명 | Importance (%) |",
+        "|------|---------|------|----------------|",
+    ])
     for i, f in enumerate(final_features, 1):
-        md_lines.append(f"{i}. `{f}`")
+        desc = get_description(f)
+        imp_val = feature_importance.get(f, "-")
+        imp_str = f"{imp_val}%" if isinstance(imp_val, (int, float)) else str(imp_val)
+        md_lines.append(f"| {i} | `{f}` | {desc} | {imp_str} |")
     md_path = output_dir / "feature_selection_pipeline_report.md"
     md_path.write_text("\n".join(md_lines), encoding="utf-8")
     logger.info("Markdown: %s", md_path)

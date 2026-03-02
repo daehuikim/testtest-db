@@ -375,18 +375,43 @@ def run_pipeline(
     if len(features) < 5:
         logger.warning("Feature 수 부족. feature selection pipeline 먼저 실행 권장.")
 
-    # 품종: 최다 품종만 예측
+    # 품종: 대표 3품종 또는 최다 품종
     variety_cfg = config.get("variety", {})
     top_variety = None
     variety_info = {}
-    if variety_cfg.get("use_top_only", True) and "품종" in df.columns:
-        cnt = df["품종"].value_counts()
-        top_n = variety_cfg.get("top_n", 1)
-        top_varieties = cnt.head(top_n).index.tolist()
-        df = df[df["품종"].isin(top_varieties)].copy()
-        variety_info = {v: int(cnt[v]) for v in top_varieties}
-        top_variety = top_varieties[0] if len(top_varieties) == 1 else ", ".join(top_varieties)
-        logger.info("예측 품종: %s (최다 %d개, 샘플수: %s)", top_varieties, top_n, variety_info)
+    rep_varieties = variety_cfg.get("representative_varieties") or []
+    if not rep_varieties:
+        try:
+            import yaml
+            fs_config_path = PROJECT_ROOT / "config" / "feature_selection_config.yaml"
+            if fs_config_path.exists():
+                with open(fs_config_path, encoding="utf-8") as f:
+                    fs_cfg = yaml.safe_load(f) or {}
+                rep_varieties = fs_cfg.get("representative_varieties") or []
+        except Exception:
+            pass
+
+    if "품종" in df.columns:
+        if rep_varieties:
+            df = df[df["품종"].isin(rep_varieties)].copy()
+            df["date"] = df["date"].astype(str).str.replace(r"\D", "", regex=True).str[:8].str.zfill(8)
+            # 유효 날짜: 대표 품종 모두 데이터 있는 날짜만
+            dates_per_var = df.groupby("품종")["date"].apply(lambda s: set(s.dropna().unique()))
+            sets_to_intersect = [dates_per_var.get(v, set()) for v in rep_varieties if dates_per_var.get(v)]
+            valid_dates = set.intersection(*sets_to_intersect) if sets_to_intersect else set()
+            valid_dates = sorted(valid_dates)
+            df = df[df["date"].isin(valid_dates)].copy()
+            variety_info = df["품종"].value_counts().to_dict()
+            top_variety = ", ".join(rep_varieties)
+            logger.info("대표 품종 %s: 유효 %d일, 샘플수: %s", rep_varieties, len(valid_dates), variety_info)
+        elif variety_cfg.get("use_top_only", True):
+            cnt = df["품종"].value_counts()
+            top_n = variety_cfg.get("top_n", 1)
+            top_varieties = cnt.head(top_n).index.tolist()
+            df = df[df["품종"].isin(top_varieties)].copy()
+            variety_info = {v: int(cnt[v]) for v in top_varieties}
+            top_variety = top_varieties[0] if len(top_varieties) == 1 else ", ".join(top_varieties)
+            logger.info("예측 품종: %s (최다 %d개, 샘플수: %s)", top_varieties, top_n, variety_info)
 
     results = {"variety": top_variety, "variety_counts": variety_info}
 
@@ -395,8 +420,8 @@ def run_pipeline(
     split_seed = seed if seed is not None else split_cfg.get("seed", RANDOM_STATE)
     train_df, test_df, test_dates = train_test_split(
         df,
-        test_days=split_cfg.get("test_days", 70),
-        test_ratio=split_cfg.get("test_ratio"),
+        test_days=split_cfg.get("test_days", 0),
+        test_ratio=split_cfg.get("test_ratio", 0.1),
         seed=split_seed,
     )
 

@@ -11,18 +11,18 @@ feature_cluster:
   seasonal_lags: [364, 365, 366]  # 항상 유지 (feature_selection과 동일)
 
 # 데이터 분할
-# Train: 전체 데이터에서 test ~70일만 제외한 나머지 전부
-# Test: 전체 unique date에서 계절 균형 랜덤 ~70일
+# test_days=0이면 test_ratio(10%) 사용 (70일 고정 아님)
 # seed 고정 시 split 고정 → 모델 비교 시 동일 split 사용
 split:
-  test_days: 70                    # 계절 균형 랜덤 선정 (봄/여름/가을/겨울 포함)
-  test_ratio: 0.1                 # test_days=0이면 unique date의 10%
-  seed: 42                         # split 고정 (바꾸면 다른 split)
+  test_days: 0                     # 0이면 test_ratio 사용
+  test_ratio: 0.1                  # 전체 unique date의 10% (계절 균형)
+  seed: 42                          # split 고정 (바꾸면 다른 split)
 
-# 품종: 최다 품종만 예측 (보고서에 품종 정보 포함)
+# 품종: 대표 3품종 또는 최다 품종
 variety:
-  use_top_only: true   # true면 최다 품종만 학습/예측
-  top_n: 1             # 상위 N개 품종 (1=최다만)
+  use_top_only: true    # true면 representative 또는 top_n 적용
+  top_n: 1              # representative_varieties 미지정 시 상위 N개
+  representative_varieties: ["후지", "홍로", "미시마"]  # 3개 지정 시: 해당 품종 데이터 있는 날짜만 유효
 
 # CV 방법: expanding, timeseries, purged
 cv:

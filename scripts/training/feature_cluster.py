@@ -50,6 +50,7 @@ def reduce_by_lag_representative(
     # Group by base (seasonal은 제외하고 clustering)
     groups: dict[str, List[str]] = defaultdict(list)
     no_lag: List[str] = []
+    auction_no_lag: List[str] = []  # auction_* (lag 없음) → clustering 대상
     always_keep: List[str] = []
     for f in features:
         if f in seasonal_feature_names:
@@ -57,16 +58,20 @@ def reduce_by_lag_representative(
             continue
         base, lag = _parse_feature(f)
         if lag is None:
-            no_lag.append(f)
+            if f.startswith("auction_"):
+                auction_no_lag.append(f)
+            else:
+                no_lag.append(f)
         else:
             groups[base].append(f)
 
-    # Single-lag or no-lag: keep all
+    # Single-lag or no-lag: keep all (auction은 별도 clustering)
     to_keep = list(no_lag)
     multi_lag_bases = {b: feats for b, feats in groups.items() if len(feats) > 1}
+    has_auction_cluster = len(auction_no_lag) >= 2
 
-    if not multi_lag_bases:
-        logger.info("Lag clustering: 다중 lag 그룹 없음")
+    if not multi_lag_bases and not has_auction_cluster:
+        logger.info("Lag clustering: 다중 lag/auction 그룹 없음")
         return features
 
     # Compute importance
@@ -101,6 +106,15 @@ def reduce_by_lag_representative(
     for base, feats in multi_lag_bases.items():
         sub = imp[feats].nlargest(top_k_per_base)
         to_keep.extend(sub.index.tolist())
+
+    # auction_* (no lag) clustering: 2개 이상이면 importance 상위 2개만
+    if has_auction_cluster:
+        auction_top_k = min(2, len(auction_no_lag))
+        auction_kept = imp.reindex(auction_no_lag).fillna(0).nlargest(auction_top_k).index.tolist()
+        to_keep.extend(auction_kept)
+        logger.info("Auction clustering: %s -> %s (top %d)", auction_no_lag, auction_kept, auction_top_k)
+    else:
+        to_keep.extend(auction_no_lag)
 
     # Single-lag bases: keep
     for base, feats in groups.items():
