@@ -46,6 +46,30 @@ python scripts/run_training_pipeline.py --skip-shap
 - `--cv purged`: CV 방법 (expanding | timeseries | purged)
 - `--model lgb catboost lstm`: 실행할 모델만 지정
 - `--no-deep`: LSTM/Transformer 스킵
+- `--plot`: 학습 후 inference + 시계열 플롯 생성
+
+학습 완료 시 최고 모델 체크포인트 저장: `checkpoints/best_model/checkpoint.joblib`
+
+---
+
+## 4. Inference & Time Series Plot
+
+학습 후 체크포인트로 test 구간 inference 및 시계열 플롯 생성 (blue=actual train, red=predicted test):
+
+```bash
+python scripts/run_inference_and_plot.py
+```
+
+옵션:
+- `--checkpoint checkpoints/best_model/checkpoint.joblib`
+- `--data temp/merged_stage0.csv`
+- `--output reports/inference_timeseries.png`
+
+또는 학습 시 `--plot` 옵션으로 한 번에 실행:
+
+```bash
+python scripts/run_training_pipeline.py --skip-shap --plot
+```
 
 ---
 

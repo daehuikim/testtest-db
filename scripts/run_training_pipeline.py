@@ -16,7 +16,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 TARGET_COL = "price_per_kg_mean"
 RANDOM_STATE = 42
+CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "best_model"
 
 # Season for MAPE breakdown
 SEASON_MONTHS = {"spring": [3, 4, 5], "summer": [6, 7, 8], "fall": [9, 10, 11], "winter": [12, 1, 2]}
@@ -582,6 +583,10 @@ def run_pipeline(
     final_model = None
     pred = None
 
+    base_models_for_checkpoint: List[Any] = []
+    meta_for_checkpoint = None
+    seq_cols_for_checkpoint: Optional[List[str]] = None
+
     if use_stacking and best_combo and len(best_combo) >= 2:
         # Stacking: best_combo 모델들 → Ridge meta
         import lightgbm as lgb
@@ -594,6 +599,7 @@ def run_pipeline(
             if mname == "lgb":
                 m = lgb.LGBMRegressor(**_lgb_params(config, use_gpu))
                 m = fit_lgb_with_fallback(m, X_tr, y_tr, "gpu" if use_gpu else "cpu")
+                base_models_for_checkpoint.append(m)
                 preds_tr.append(m.predict(X_tr))
                 preds_te.append(m.predict(X_te))
             elif mname == "catboost":
@@ -606,12 +612,14 @@ def run_pipeline(
                         m.fit(X_tr, y_tr)
                     else:
                         raise
+                base_models_for_checkpoint.append(m)
                 preds_tr.append(m.predict(X_tr))
                 preds_te.append(m.predict(X_te))
             elif mname == "elasticnet":
                 from sklearn.linear_model import ElasticNet
                 m = ElasticNet(alpha=0.1, l1_ratio=0.5, random_state=RANDOM_STATE)
                 m.fit(X_tr, y_tr)
+                base_models_for_checkpoint.append(m)
                 preds_tr.append(m.predict(X_tr))
                 preds_te.append(m.predict(X_te))
             elif mname == "lstm":
@@ -623,6 +631,8 @@ def run_pipeline(
                     X_seq_te = build_sequence_array(test_df, seq_cols)
                     m = LSTMWrapper(seq_len=len(seq_cols), hidden=cfg.get("hidden", 64), layers=cfg.get("layers", 2), epochs=cfg.get("epochs", 100), patience=cfg.get("patience", 10), dropout=cfg.get("dropout", 0.2))
                     m.fit(X_seq_tr, y_tr.values)
+                    base_models_for_checkpoint.append(m)
+                    seq_cols_for_checkpoint = seq_cols
                     preds_tr.append(m.predict(X_seq_tr))
                     preds_te.append(m.predict(X_seq_te))
             elif mname == "transformer":
@@ -634,6 +644,8 @@ def run_pipeline(
                     X_seq_te = build_sequence_array(test_df, seq_cols)
                     m = TransformerWrapper(seq_len=len(seq_cols), d_model=cfg.get("d_model", 32), nhead=cfg.get("nhead", 4), num_layers=cfg.get("num_layers", 2), epochs=cfg.get("epochs", 100), patience=cfg.get("patience", 10), dropout=cfg.get("dropout", 0.2))
                     m.fit(X_seq_tr, y_tr.values)
+                    base_models_for_checkpoint.append(m)
+                    seq_cols_for_checkpoint = seq_cols
                     preds_tr.append(m.predict(X_seq_tr))
                     preds_te.append(m.predict(X_seq_te))
         if len(preds_tr) >= 2:
@@ -645,6 +657,7 @@ def run_pipeline(
                     raise ValueError("Stacking: 유효한 train 샘플 부족")
                 meta = Ridge(alpha=1.0, random_state=RANDOM_STATE)
                 meta.fit(oof_tr[valid_tr], y_tr.values[valid_tr])
+                meta_for_checkpoint = meta
                 valid_te_stk = np.all(np.isfinite(oof_te), axis=1)
                 pred = np.full(len(oof_te), np.nan)
                 if valid_te_stk.sum() > 0:
@@ -656,6 +669,8 @@ def run_pipeline(
                 use_stacking = False
                 best_name = best_single
                 pred = None
+                base_models_for_checkpoint = []
+                meta_for_checkpoint = None
         else:
             use_stacking = False
 
@@ -666,6 +681,7 @@ def run_pipeline(
             from feature_selection.device_utils import fit_lgb_with_fallback
             final_model = lgb.LGBMRegressor(**_lgb_params(config, use_gpu))
             final_model = fit_lgb_with_fallback(final_model, X_tr, y_tr, "gpu" if use_gpu else "cpu")
+            base_models_for_checkpoint.append(final_model)
             pred = final_model.predict(X_te) if valid_te.sum() > 0 else None
         elif best_name == "catboost":
             import catboost as cb
@@ -679,11 +695,13 @@ def run_pipeline(
                     final_model.fit(X_tr, y_tr)
                 else:
                     raise
+            base_models_for_checkpoint.append(final_model)
             pred = final_model.predict(X_te) if valid_te.sum() > 0 else None
         elif best_name == "elasticnet":
             from sklearn.linear_model import ElasticNet
             final_model = ElasticNet(alpha=0.1, l1_ratio=0.5, random_state=RANDOM_STATE)
             final_model.fit(X_tr, y_tr)
+            base_models_for_checkpoint.append(final_model)
             pred = final_model.predict(X_te) if valid_te.sum() > 0 else None
         elif best_name == "lstm":
             from training.deep_models import LSTMWrapper, _get_lag_sequence_cols, build_sequence_array
@@ -702,6 +720,8 @@ def run_pipeline(
                 else:
                     final_model = LSTMWrapper(seq_len=len(seq_cols), hidden=cfg.get("hidden", 64), layers=cfg.get("layers", 2), epochs=cfg.get("epochs", 100), dropout=cfg.get("dropout", 0.2))
                     final_model.fit(X_seq_tr, y_tr.values)
+                base_models_for_checkpoint.append(final_model)
+                seq_cols_for_checkpoint = seq_cols
                 pred = final_model.predict(X_seq_te) if valid_te.sum() > 0 else None
             else:
                 pred = None
@@ -722,6 +742,8 @@ def run_pipeline(
                 else:
                     final_model = TransformerWrapper(seq_len=len(seq_cols), d_model=cfg.get("d_model", 32), nhead=cfg.get("nhead", 4), num_layers=cfg.get("num_layers", 2), epochs=cfg.get("epochs", 100), dropout=cfg.get("dropout", 0.2))
                     final_model.fit(X_seq_tr, y_tr.values)
+                base_models_for_checkpoint.append(final_model)
+                seq_cols_for_checkpoint = seq_cols
                 pred = final_model.predict(X_seq_te) if valid_te.sum() > 0 else None
             else:
                 pred = None
@@ -786,15 +808,50 @@ def run_pipeline(
                     })
             examples = sorted(examples, key=lambda x: (list(SEASON_MONTHS).index(x["season"]), x["date"]))[:10]
             results["prediction_examples"] = examples
-            logger.info("Test 예측 사례 (계절별):")
+            logger.info("Test prediction examples (by season):")
             for ex in examples:
                 err = abs(ex["actual"] - ex["predicted"]) / (ex["actual"] + 1e-8) * 100
-                logger.info("  %s %s | 실제 %.0f원/kg → 예측 %.0f원/kg (오차 %.1f%%)", ex["date"], ex["season"], ex["actual"], ex["predicted"], err)
+                logger.info("  %s %s | actual %.0f KRW/kg -> predicted %.0f KRW/kg (error %.1f%%)", ex["date"], ex["season"], ex["actual"], ex["predicted"], err)
 
     results["best_model"] = best_name
     results["use_stacking"] = use_stacking
     results["n_features"] = len(features)
     results["test_dates"] = len(test_dates)
+
+    # Save best model checkpoint for serving/inference
+    if pred is not None and (base_models_for_checkpoint or meta_for_checkpoint):
+        try:
+            import joblib
+            CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+            base_names = list(best_combo) if use_stacking and best_combo else [best_name]
+            rep_varieties = config.get("variety", {}).get("representative_varieties") or []
+            if not rep_varieties:
+                try:
+                    import yaml
+                    fc = PROJECT_ROOT / "config" / "feature_selection_config.yaml"
+                    if fc.exists():
+                        with open(fc, encoding="utf-8") as f:
+                            rep_varieties = (yaml.safe_load(f) or {}).get("representative_varieties") or []
+                except Exception:
+                    pass
+            ckpt = {
+                "use_stacking": use_stacking,
+                "best_name": best_name,
+                "meta": meta_for_checkpoint,
+                "base_models": base_models_for_checkpoint,
+                "base_names": base_names,
+                "features": features,
+                "use_log": use_log,
+                "seq_cols": seq_cols_for_checkpoint,
+                "train_dates": sorted(train_df["date"].dropna().unique().tolist()),
+                "test_dates": test_dates,
+                "variety_filter": rep_varieties,
+            }
+            ckpt_path = CHECKPOINT_DIR / "checkpoint.joblib"
+            joblib.dump(ckpt, ckpt_path)
+            logger.info("Best model checkpoint saved: %s", ckpt_path)
+        except Exception as e:
+            logger.warning("Checkpoint save failed: %s", str(e)[:80])
 
     # Report
     report_path = PROJECT_ROOT / "reports" / "training_pipeline_report.md"
@@ -802,17 +859,17 @@ def run_pipeline(
     lines = [
         "# Training Pipeline Report",
         "",
-        "## 예측 품종",
+        "## Target Variety",
         f"**{results.get('variety', '-')}**",
         "",
-        "### 품종별 샘플 수 (학습에 사용된 품종)",
-        "| 품종 | 샘플 수 |",
-        "|------|---------|",
+        "### Sample Count by Variety",
+        "| Variety | Count |",
+        "|---------|-------|",
     ]
     for v, c in results.get("variety_counts", {}).items():
         lines.append(f"| {v} | {c} |")
     if not results.get("variety_counts"):
-        lines.append("| (전체 품종) | - |")
+        lines.append("| (all varieties) | - |")
     lines.extend([
         "",
         "## Baseline",
@@ -831,7 +888,7 @@ def run_pipeline(
         lines.append(f"| {k} | {v['mean']:.2f} | {v['std']:.2f} | {v['worst']:.2f} |")
     lines.extend([
         "",
-        f"## CV 방법: {config.get('cv', {}).get('method', 'expanding')}",
+        f"## CV Method: {config.get('cv', {}).get('method', 'expanding')}",
         "",
         f"## Best Model: {best_name}",
         "",
@@ -842,7 +899,7 @@ def run_pipeline(
     for k, v in results.get("test_metrics", {}).items():
         lines.append(f"| {k} | {v:.4f} |")
     lines.append("")
-    lines.append("*(mape: 원래 가격 스케일, mape_log: log1p 변환 후 MAPE)*")
+    lines.append("*(mape: raw price scale, mape_log: MAPE on log1p-transformed)*")
     if "test_metrics" not in results and isinstance(results.get("test_mape"), (int, float)):
         lines.append(f"| mape | {results['test_mape']:.4f} |")
     lines.extend([
@@ -856,15 +913,15 @@ def run_pipeline(
     ex_list = results.get("prediction_examples", [])
     lines.extend([
         "",
-        "## Test 예측 사례 (계절별)",
-        "| 날짜 | 계절 | 실제가격(원/kg) | 예측가격(원/kg) | 오차(%) |",
-        "|------|------|----------------|----------------|---------|",
+        "## Test Prediction Examples (by Season)",
+        "| Date | Season | Actual (KRW/kg) | Predicted (KRW/kg) | Error (%) |",
+        "|------|--------|-----------------|--------------------|-----------|",
     ])
     for ex in ex_list:
         err = abs(ex["actual"] - ex["predicted"]) / (ex["actual"] + 1e-8) * 100
         lines.append(f"| {ex['date']} | {ex['season']} | {ex['actual']:,.0f} | {ex['predicted']:,.0f} | {err:.1f}% |")
     if not ex_list:
-        lines.append("| *(유효한 예측 없음)* | | | | |")
+        lines.append("| *(no valid predictions)* | | | | |")
     report_path.write_text("\n".join(lines), encoding="utf-8")
     logger.info("Report: %s", report_path)
 
@@ -881,9 +938,10 @@ def main():
     parser.add_argument("--model", type=str, nargs="+", default=None, help="실행할 모델만 (lgb, catboost, elasticnet, lstm, transformer)")
     parser.add_argument("--cv", type=str, default=None, help="CV 방법: expanding, timeseries, purged")
     parser.add_argument("--no-deep", action="store_true", help="LSTM/Transformer 스킵")
+    parser.add_argument("--plot", action="store_true", help="학습 후 inference + 시계열 플롯 생성")
     args = parser.parse_args()
 
-    run_pipeline(
+    results = run_pipeline(
         data_path=Path(args.data_path) if args.data_path else None,
         config_path=Path(args.config) if args.config else None,
         seed=args.seed,
@@ -893,6 +951,12 @@ def main():
         cv_method=args.cv,
         no_deep=args.no_deep,
     )
+    if args.plot and results.get("best_model"):
+        try:
+            from run_inference_and_plot import run_inference_and_plot
+            run_inference_and_plot()
+        except Exception as e:
+            logger.warning("Inference plot failed: %s", str(e)[:80])
 
 
 if __name__ == "__main__":
