@@ -18,11 +18,12 @@ split:
   test_ratio: 0.1                  # 전체 unique date의 10% (계절 균형)
   seed: 42                          # split 고정 (바꾸면 다른 split)
 
-# 품종: 대표 3품종 또는 최다 품종
+# 품종: 대표 품종 또는 최다 품종
 variety:
   use_top_only: true    # true면 representative 또는 top_n 적용
   top_n: 1              # representative_varieties 미지정 시 상위 N개
-  representative_varieties: ["후지", "홍로", "미시마"]  # 3개 지정 시: 해당 품종 데이터 있는 날짜만 유효
+  # 1개: ["후지"], 3개: ["후지","홍로","미시마"] - 해당 품종 데이터 있는 날짜만 유효
+  representative_varieties: ["후지"]
 
 # CV 방법: expanding, timeseries, purged
 cv:
@@ -72,10 +73,15 @@ elasticnet:
   alphas: [0.01, 0.1, 1.0, 10.0]
   l1_ratios: [0.1, 0.5, 0.9]
 
-# Stacking
+# 실행할 모델 (미지정 시 전체: lgb, catboost, elasticnet, lstm, transformer)
+# models: [lgb, catboost, elasticnet, lstm, transformer]
+models: null
+
+# Stacking (LGB+CatBoost, 필요시 LSTM 포함)
 stacking:
   oof_corr_threshold: 0.95         # LGBM vs CatBoost OOF corr < 이면 stacking
   meta_model: "ridge"
+  include_lstm: false              # true면 LSTM OOF도 stacking에 포함 (다양한 앙상블)
 
 # Deep 모델 (LSTM, Transformer)
 lstm:

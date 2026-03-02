@@ -253,6 +253,7 @@ def expanding_cv_mape(
     model_name: str,
     config: dict,
     use_log: bool = False,
+    cv_method: Optional[str] = None,
 ) -> tuple:
     """CV로 MAPE 평균, std, worst fold 반환. OOF 예측도 반환 (stacking용)."""
     from training.cv_splits import get_cv_folds
@@ -273,7 +274,7 @@ def expanding_cv_mape(
 
     fold_gen = get_cv_folds(
         data,
-        method=cv_cfg.get("method", "expanding"),
+        method=config["cv"].get("method", "expanding"),
         n_folds=cv_cfg.get("n_folds", 5),
         n_splits=cv_cfg.get("n_folds", 5),
         valid_days=cv_cfg.get("valid_days", 30),
@@ -478,9 +479,12 @@ def run_pipeline(
             logger.warning("Feature refine 실패: %s → 상위 60개", str(e)[:40])
             features = features[:60]
 
-    # Model comparison (다양한 모델)
+    # Model comparison (다양한 모델: LGB, CatBoost, ElasticNet, LSTM, Transformer)
+    cfg_models = config.get("models")
     if models:
         model_list = list(models)
+    elif cfg_models:
+        model_list = cfg_models if isinstance(cfg_models, list) else [cfg_models]
     else:
         model_list = ["lgb", "catboost", "elasticnet"]
         if not no_deep:
@@ -488,34 +492,51 @@ def run_pipeline(
                 model_list.append("lstm")
             if config.get("transformer", {}).get("enabled", True):
                 model_list.append("transformer")
+    logger.info("실행 모델: %s", model_list)
 
     model_scores = {}
-    oof_lgb, oof_cb = None, None
+    oof_lgb, oof_cb, oof_lstm, oof_transformer = None, None, None, None
     for name in model_list:
         try:
             mean_mape, std_mape, worst_mape, oof = expanding_cv_mape(
-                train_df, features, name, config, use_log=use_log,
+                train_df, features, name, config, use_log=use_log, cv_method=cv_method,
             )
             model_scores[name] = {"mean": mean_mape, "std": std_mape, "worst": worst_mape}
             if name == "lgb":
                 oof_lgb = oof
             elif name == "catboost":
                 oof_cb = oof
+            elif name == "lstm":
+                oof_lstm = oof
+            elif name == "transformer":
+                oof_transformer = oof
             logger.info("%s CV MAPE: %.2f%% ± %.2f (worst %.2f%%)", name, mean_mape, std_mape, worst_mape)
         except ImportError as e:
             logger.warning("%s 스킵: %s", name, str(e)[:50])
+        except Exception as e:
+            logger.warning("%s 실패: %s", name, str(e)[:80])
 
     results["cv_scores"] = model_scores
 
-    # Stacking decision
+    # Stacking decision (LGB+CatBoost, 필요시 LSTM 포함)
     use_stacking = False
+    stacking_oofs = []
     if oof_lgb is not None and oof_cb is not None:
         valid = np.isfinite(oof_lgb) & np.isfinite(oof_cb)
         if valid.sum() > 10:
             corr = np.corrcoef(oof_lgb[valid], oof_cb[valid])[0, 1]
             thresh = config.get("stacking", {}).get("oof_corr_threshold", 0.95)
             use_stacking = corr < thresh
-            logger.info("LGBM vs CatBoost OOF corr: %.3f → stacking: %s", corr, use_stacking)
+            stacking_oofs = [oof_lgb, oof_cb]
+            if use_stacking and config.get("stacking", {}).get("include_lstm") and oof_lstm is not None:
+                valid3 = valid & np.isfinite(oof_lstm)
+                if valid3.sum() > 10:
+                    stacking_oofs.append(oof_lstm)
+                    logger.info("LGBM vs CatBoost OOF corr: %.3f → 3-model stacking (LGB+CB+LSTM)", corr)
+                else:
+                    logger.info("LGBM vs CatBoost OOF corr: %.3f → stacking (LGB+CB)", corr)
+            else:
+                logger.info("LGBM vs CatBoost OOF corr: %.3f → stacking: %s", corr, use_stacking)
 
     # Best model selection
     best_name = min(
@@ -535,15 +556,18 @@ def run_pipeline(
     final_model = None
     pred = None
 
-    if use_stacking and oof_lgb is not None and oof_cb is not None:
-        # Stacking: LGBM + CatBoost → Ridge meta
+    if use_stacking and len(stacking_oofs) >= 2:
+        # Stacking: LGBM + CatBoost (+ LSTM) → Ridge meta
         import lightgbm as lgb
         import catboost as cb
         from sklearn.linear_model import Ridge
         from feature_selection.device_utils import fit_lgb_with_fallback
 
+        preds_tr, preds_te = [], []
         m_lgb = lgb.LGBMRegressor(**_lgb_params(config, use_gpu))
         m_lgb = fit_lgb_with_fallback(m_lgb, X_tr, y_tr, "gpu" if use_gpu else "cpu")
+        preds_tr.append(m_lgb.predict(X_tr))
+        preds_te.append(m_lgb.predict(X_te))
         try:
             m_cb = cb.CatBoostRegressor(**_cb_params(config, use_gpu))
             m_cb.fit(X_tr, y_tr)
@@ -554,15 +578,24 @@ def run_pipeline(
                 m_cb.fit(X_tr, y_tr)
             else:
                 raise
-        p_lgb = m_lgb.predict(X_tr)
-        p_cb = m_cb.predict(X_tr)
+        preds_tr.append(m_cb.predict(X_tr))
+        preds_te.append(m_cb.predict(X_te))
+        if len(stacking_oofs) >= 3 and oof_lstm is not None:
+            from training.deep_models import LSTMWrapper, _get_lag_sequence_cols, build_sequence_array
+            seq_cols = _get_lag_sequence_cols(features, max_lag=config.get("lstm", {}).get("seq_len", 30))
+            if len(seq_cols) >= 5:
+                X_seq_tr = build_sequence_array(train_full, seq_cols)
+                X_seq_te = build_sequence_array(test_df, seq_cols)
+                cfg = config.get("lstm", {})
+                m_lstm = LSTMWrapper(seq_len=len(seq_cols), hidden=cfg.get("hidden", 64), layers=cfg.get("layers", 2), epochs=cfg.get("epochs", 50))
+                m_lstm.fit(X_seq_tr, y_tr.values)
+                preds_tr.append(m_lstm.predict(X_seq_tr))
+                preds_te.append(m_lstm.predict(X_seq_te))
         meta = Ridge(alpha=1.0, random_state=RANDOM_STATE)
-        meta.fit(np.column_stack([p_lgb, p_cb]), y_tr)
-        pred_lgb = m_lgb.predict(X_te)
-        pred_cb = m_cb.predict(X_te)
-        pred = meta.predict(np.column_stack([pred_lgb, pred_cb]))
+        meta.fit(np.column_stack(preds_tr), y_tr)
+        pred = meta.predict(np.column_stack(preds_te))
         best_name = "stacking"
-        logger.info("Stacking (LGBM+CatBoost→Ridge) 적용")
+        logger.info("Stacking (%d models→Ridge) 적용", len(preds_tr))
     elif best_name == "lgb":
         import lightgbm as lgb
         from feature_selection.device_utils import fit_lgb_with_fallback

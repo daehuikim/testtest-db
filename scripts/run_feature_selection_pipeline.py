@@ -127,6 +127,16 @@ def run_pipeline(
     s5 = stage5_common(df, features, config=config)
     features = list(s5) if s5 else features
 
+    # Seasonal lags 항상 포함 (Stage 1~5에서 제거되어도 복원)
+    seasonal_cfg = config.get("seasonal_lags", {})
+    seasonal_list = seasonal_cfg.get("lags", [364, 365, 366]) if isinstance(seasonal_cfg, dict) else [364, 365, 366]
+    if seasonal_cfg.get("enabled", True):
+        for lag in seasonal_list:
+            col = f"price_per_kg_mean_lag{lag}"
+            if col in df.columns and col not in features:
+                features.append(col)
+                logger.info("Seasonal lag 복원: %s", col)
+
     # Stage 6: Lag clustering (base별 대표 lag 1개)
     s5_count = len(features)
     cluster_cfg = config.get("feature_cluster", {})
@@ -171,6 +181,17 @@ def run_pipeline(
     variety_counts = df["품종"].value_counts()
     variety_ratios = (variety_counts / len(df) * 100).round(1).to_dict()
     representative = config.get("representative_varieties") or []
+    if not representative:
+        whitelist = (config.get("variety_filter") or {}).get("whitelist")
+        if whitelist:
+            representative = whitelist if isinstance(whitelist, list) else [whitelist]
+
+    # 중요도순 정렬 (리포트용)
+    sorted_features = sorted(
+        final_features,
+        key=lambda x: (feature_importance.get(x) or 0),
+        reverse=True,
+    )
 
     # 리포트 저장
     report = {
@@ -186,6 +207,7 @@ def run_pipeline(
         "stage5_kept": s5_count,
         "stage6_kept": len(final_features),
         "final_features": final_features,
+        "final_features_ranked": sorted_features,
         "feature_importance": feature_importance,
         "n_final": len(final_features),
     }
@@ -212,6 +234,8 @@ def run_pipeline(
                 return meta[base_key].replace("1일", f"{lag}일")
             if base in meta:
                 return f"{lag}일 전 " + meta[base]
+            if base == "price_per_kg_mean":
+                return f"{lag}일 전 경매 1kg당 가격"
             if "domae" in base:
                 return f"{lag}일 전 도매 관련"
             if "somae" in base:
@@ -275,7 +299,7 @@ def run_pipeline(
         "| 순위 | Feature | 설명 | Importance (%) |",
         "|------|---------|------|----------------|",
     ])
-    for i, f in enumerate(final_features, 1):
+    for i, f in enumerate(sorted_features, 1):
         desc = get_description(f)
         imp_val = feature_importance.get(f, "-")
         imp_str = f"{imp_val}%" if isinstance(imp_val, (int, float)) else str(imp_val)

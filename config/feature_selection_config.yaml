@@ -14,8 +14,9 @@ variety_filter:
   whitelist: null    # ["후지","홍로","미시마"] 지정 시 해당만
   max_varieties: null # 10 지정 시 상위 10개만
 
-# 대표 품종 3개 (학습 파이프라인용: 해당 품종 데이터 있는 날짜만 유효)
-representative_varieties: ["후지", "홍로", "미시마"]
+# 대표 품종 (학습 파이프라인용: 해당 품종 데이터 있는 날짜만 유효)
+# 1개: ["후지"], 3개: ["후지","홍로","미시마"]
+representative_varieties: ["후지"]
 
 lag_depths:
   target_price: 60   # price_per_kg_mean lag 1~60 (autoregressive)
