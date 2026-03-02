@@ -122,11 +122,41 @@ class DataMerger:
         df["date"] = self._normalize_date(df["TM"])
         return df
 
+    def _fill_low_tx_with_week_median(self, df: pd.DataFrame, min_tx: int) -> pd.DataFrame:
+        """거래건수 부족 일자: 앞뒤 ±7일 동일 품종 median으로 채움 (merge_config.low_tx=fill_week)."""
+        df = df.copy()
+        df["_date_dt"] = pd.to_datetime(df["date"], format="%Y%m%d")
+        if (df["auction_transaction_count"] < min_tx).sum() == 0:
+            return df.drop(columns=["_date_dt"], errors="ignore")
+        filled = []
+        for variety, group in df.groupby("품종"):
+            g = group.sort_values("_date_dt").reset_index(drop=True)
+            for i in range(len(g)):
+                row = g.iloc[i]
+                if row["auction_transaction_count"] >= min_tx:
+                    filled.append(row.to_dict())
+                    continue
+                lo = row["_date_dt"] - pd.Timedelta(days=7)
+                hi = row["_date_dt"] + pd.Timedelta(days=7)
+                window = g[(g["_date_dt"] >= lo) & (g["_date_dt"] <= hi) & (g["auction_transaction_count"] >= min_tx)]
+                if len(window) > 0:
+                    r = row.to_dict()
+                    r["price_per_kg_mean"] = window["price_per_kg_mean"].median()
+                    filled.append(r)
+                else:
+                    filled.append(row.to_dict())
+        return pd.DataFrame(filled).drop(columns=["_date_dt"], errors="ignore")
+
     def aggregate_auction(self, df: pd.DataFrame) -> pd.DataFrame:
+        merge_cfg = self._config.get("merge_config", {})
+        agg_method = merge_cfg.get("auction_agg", "mean")
+        agg_map = {"mean": "mean", "median": "median"}
+        agg_func = agg_map.get(agg_method, "mean")
+
         agg = (
             df.groupby(["date", VARIETY_COL_AUCTION], as_index=False)
             .agg(
-                price_per_kg_mean=("price_per_kg", "mean"),
+                price_per_kg_mean=("price_per_kg", agg_func),
                 price_per_kg_median=("price_per_kg", "median"),
                 price_per_kg_std=("price_per_kg", "std"),
                 auction_quantity_sum=("수량", "sum"),
@@ -135,6 +165,17 @@ class DataMerger:
             )
             .rename(columns={VARIETY_COL_AUCTION: "품종"})
         )
+
+        min_tx = merge_cfg.get("min_tx_count", 5)
+        low_tx = merge_cfg.get("low_tx", "exclude")
+        if low_tx == "exclude":
+            before = len(agg)
+            agg = agg[agg["auction_transaction_count"] >= min_tx].copy()
+            logger.info("Low tx exclude: %d -> %d rows (min_tx=%d)", before, len(agg), min_tx)
+        elif low_tx == "fill_week":
+            agg = self._fill_low_tx_with_week_median(agg, min_tx)
+            logger.info("Low tx fill_week 적용 (min_tx=%d)", min_tx)
+
         return agg
 
     def _aggregate_domae_somae(self, df: pd.DataFrame, prefix: str) -> pd.DataFrame:
@@ -242,6 +283,11 @@ class DataMerger:
             logger.info("Seasonal lags 추가: %s", seasonal_list)
 
         domae = self.load_domae()
+        if not domae.empty:
+            merge_cfg = self._config.get("merge_config", {})
+            if merge_cfg.get("domae_filter") == "garak" and "MRKT_NM" in domae.columns:
+                domae = domae[domae["MRKT_NM"] == "가락도매"].copy()
+                logger.info("Domae filtered: 가락도매 only (%d rows)", len(domae))
         domae_agg = self._aggregate_domae_somae(domae, "domae") if not domae.empty else None
         if domae_agg is not None:
             merged = self._add_lag_merge(merged, domae_agg, self.domae_somae_lag, ("date", "품종"))

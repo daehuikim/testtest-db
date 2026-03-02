@@ -35,7 +35,14 @@ python scripts/run_feature_selection_pipeline.py --save-merged
 
 ## 3. 학습
 
+**Best config 적용**: merge_config(exp_1: mean, fill_week), LSTM stacking, 대용량 LSTM(16 layers, 256 hidden)
+
 ```bash
+# merged_stage0.csv 재생성 (best merge config 적용)
+rm -f temp/merged_stage0.csv
+python scripts/run_feature_selection_pipeline.py --save-merged
+
+# 학습 (LSTM 포함, GPU 활용)
 python scripts/run_training_pipeline.py --skip-shap
 ```
 

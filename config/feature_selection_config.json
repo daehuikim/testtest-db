@@ -1,5 +1,11 @@
 {
   "use_gpu": true,
+  "merge_config": {
+    "auction_agg": "mean",
+    "domae_filter": "all",
+    "low_tx": "fill_week",
+    "min_tx_count": 5
+  },
   "variety_filter": {
     "min_pct": 2.0,
     "whitelist": null,

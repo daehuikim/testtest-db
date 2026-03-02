@@ -79,32 +79,31 @@ elasticnet:
 # models: [lgb, catboost, elasticnet, lstm, transformer]
 models: null
 
-# Stacking (LGB+CatBoost, 필요시 LSTM 포함)
+# Stacking (LGB+CatBoost+LSTM 포함)
 stacking:
   oof_corr_threshold: 0.95         # LGBM vs CatBoost OOF corr < 이면 stacking
   meta_model: "ridge"
-  include_lstm: false              # true면 LSTM OOF도 stacking에 포함 (다양한 앙상블)
+  include_lstm: true               # LSTM OOF stacking 포함 (GPU 여유 시)
 
 # 월별 라우팅: LGBM vs LSTM(pre-train + fine-tune)
 monthly_routing:
   use_lstm: true                   # true면 LSTM pre-train→월별 fine-tune, false면 LGBM 월별
 
-# Deep 모델 (LSTM, Transformer) - eval, early stopping, checkpoint, dropout
-# seq_len: 월별 12개 모델 저장/불러 시 최근 30일 lag로 충분
-# monthly_prefinetune: 전체 pre-train → 월별 fine-tune (12개)
+# Deep 모델 (LSTM) - GPU 여유 시 대용량 (layers/patience/epochs 확대)
+# Best merge config(exp_1) + LSTM stacking
 lstm:
   enabled: true
   seq_len: 30
-  hidden: 128
-  layers: 8
-  epochs: 150
-  patience: 15
+  hidden: 256
+  layers: 16
+  epochs: 400
+  patience: 50
   dropout: 0.3
   # 월별 pre-train + fine-tune용
-  pretrain_epochs: 100
-  finetune_epochs: 30
+  pretrain_epochs: 200
+  finetune_epochs: 80
   finetune_lr: 0.0001
-  finetune_patience: 10
+  finetune_patience: 25
 
 transformer:
   enabled: false         # MAPE 40%+ 수준으로 비활성화
