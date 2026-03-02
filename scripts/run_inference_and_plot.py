@@ -73,7 +73,10 @@ def predict_batch(ckpt: dict, df: pd.DataFrame, dates: list) -> tuple:
     use_log = ckpt["use_log"]
     use_stacking = ckpt["use_stacking"]
     use_seasonal_routing = ckpt.get("use_seasonal_routing", False)
+    use_monthly_routing = ckpt.get("use_monthly_routing", False)
+    use_monthly_lstm_routing = ckpt.get("use_monthly_lstm_routing", False)
     seasonal_models = ckpt.get("seasonal_models")
+    monthly_models = ckpt.get("monthly_models")
     base_models = ckpt.get("base_models", [])
     base_names = ckpt.get("base_names", [])
     meta = ckpt.get("meta")
@@ -88,7 +91,24 @@ def predict_batch(ckpt: dict, df: pd.DataFrame, dates: list) -> tuple:
     med = sub.median(numeric_only=True)
     sub = sub.fillna(med)
 
-    if use_seasonal_routing and seasonal_models:
+    if use_monthly_routing and monthly_models:
+        sub["_month"] = pd.to_datetime(sub["date"].astype(str), format="%Y%m%d").dt.month
+        pred_list = []
+        fallback_m = list(monthly_models.values())[0]
+        if use_monthly_lstm_routing and seq_cols:
+            from training.deep_models import build_sequence_array
+            for idx in range(len(sub)):
+                month = sub.iloc[idx]["_month"]
+                m = monthly_models.get(month, fallback_m)
+                X_seq = build_sequence_array(sub.iloc[[idx]], seq_cols)
+                pred_list.append(m.predict(X_seq)[0])
+        else:
+            for idx in range(len(sub)):
+                month = sub.iloc[idx]["_month"]
+                m = monthly_models.get(month, fallback_m)
+                pred_list.append(m.predict(sub[features].iloc[[idx]])[0])
+        pred = np.array(pred_list)
+    elif use_seasonal_routing and seasonal_models:
         sub["_month"] = pd.to_datetime(sub["date"].astype(str), format="%Y%m%d").dt.month
         sub["_season"] = sub["_month"].apply(_month_to_season)
         pred_list = []
@@ -171,6 +191,31 @@ def run_inference_and_plot(
     test_pred, test_ordered_dates = predict_batch(ckpt, df, test_dates)
     test_plot_df = pd.DataFrame({"date": test_ordered_dates, "plot_price": test_pred[: len(test_ordered_dates)]})
     test_plot_df["source"] = "test"
+
+    # 월별 모델 사용 시: 월별 성능 요약 출력
+    if ckpt.get("use_monthly_routing") and test_actual_df.shape[0] > 0 and len(test_pred) > 0:
+        merge_df = test_actual_df.merge(
+            test_plot_df[["date", "plot_price"]],
+            on="date",
+            how="inner",
+        )
+        if not merge_df.empty:
+            merge_df["date"] = merge_df["date"].astype(str).str.replace(r"\D", "", regex=True).str[:8].str.zfill(8)
+            merge_df["_month"] = pd.to_datetime(merge_df["date"], format="%Y%m%d", errors="coerce").dt.month
+            merge_df = merge_df[merge_df["_month"].notna()]
+            if not merge_df.empty:
+
+                def _mape(a, p, eps=1e-8):
+                    return np.mean(np.abs((a - p) / (np.abs(a) + eps))) * 100
+
+                logger.info("Per-month model performance (월별 모델 성능):")
+                for m in sorted(merge_df["_month"].unique()):
+                    sub = merge_df[merge_df["_month"] == m]
+                    if len(sub) > 0:
+                        mape_val = _mape(sub["price"].values, sub["plot_price"].values)
+                        logger.info("  month %2d MAPE: %.2f%% (n=%d)", int(m), mape_val, len(sub))
+                overall = _mape(merge_df["price"].values, merge_df["plot_price"].values)
+                logger.info("  overall MAPE: %.2f%% (n=%d)", overall, len(merge_df))
 
     # Build plot data: all dates sorted
     train_df["source"] = "train"

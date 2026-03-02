@@ -431,6 +431,177 @@ def _seasonal_routing_cv(
     return np.mean(fold_mapes), oof_pred
 
 
+def _monthly_routing_cv(
+    train_df: pd.DataFrame,
+    features: list,
+    config: dict,
+    use_log: bool,
+    use_mape_loss: bool,
+    use_gpu: bool,
+    cv_method: Optional[str] = None,
+) -> tuple:
+    """월별(1~12) LGBM 모델, 월 기준 라우팅. (OOF MAPE, oof_pred) 반환."""
+    from training.cv_splits import get_cv_folds
+
+    data = train_df.sort_values("date").reset_index(drop=True)
+    data = data[data[TARGET_COL].notna()].copy()
+    data = data.fillna(data[features].median())
+    data["_month"] = pd.to_datetime(data["date"].astype(str), format="%Y%m%d").dt.month
+    X = data[features]
+    y = data[Y_TARGET_COL].values if Y_TARGET_COL in data.columns else data[TARGET_COL].values
+    y_orig = data[TARGET_COL].values
+    oof_pred = np.full(len(data), np.nan)
+    fold_mapes = []
+    cv_cfg = config.get("cv", {})
+    _cv_method = cv_method or cv_cfg.get("method", "expanding")
+    config["cv"] = {**cv_cfg, "method": _cv_method}
+
+    fold_gen = get_cv_folds(
+        data,
+        method=config["cv"].get("method", "expanding"),
+        n_folds=cv_cfg.get("n_folds", 5),
+        n_splits=cv_cfg.get("n_folds", 5),
+        valid_days=cv_cfg.get("valid_days", 30),
+        purge_days=cv_cfg.get("purge_days", 7),
+        embargo_days=cv_cfg.get("embargo_days", 3),
+    )
+
+    for train_idx, valid_idx in fold_gen:
+        try:
+            import lightgbm as lgb
+            from feature_selection.device_utils import fit_lgb_with_fallback
+            models_by_month = {}
+            for month in range(1, 13):
+                mask = (data.iloc[train_idx]["_month"] == month).values
+                if mask.sum() < 20:
+                    continue
+                tr_idx = np.array(train_idx)[mask]
+                m = lgb.LGBMRegressor(**_lgb_params(config, use_gpu, use_mape_loss))
+                m = fit_lgb_with_fallback(m, X.iloc[tr_idx], y[tr_idx], "gpu" if use_gpu else "cpu")
+                models_by_month[month] = m
+            if len(models_by_month) < 2:
+                continue
+            fallback_m = list(models_by_month.values())[0]
+            for i in valid_idx:
+                month = data.iloc[i]["_month"]
+                m = models_by_month.get(month, fallback_m)
+                oof_pred[i] = m.predict(X.iloc[[i]])[0]
+            pred_orig = np.expm1(oof_pred[valid_idx]) if use_log else oof_pred[valid_idx]
+            valid_mask = np.isfinite(pred_orig) & np.isfinite(y_orig[valid_idx])
+            if valid_mask.sum() > 5:
+                fold_mapes.append(mape(y_orig[valid_idx][valid_mask], pred_orig[valid_mask]))
+        except Exception as e:
+            logger.warning("Monthly routing fold 실패: %s", str(e)[:40])
+
+    if not fold_mapes:
+        return float("inf"), oof_pred
+    return np.mean(fold_mapes), oof_pred
+
+
+def _monthly_routing_cv_lstm(
+    train_df: pd.DataFrame,
+    features: list,
+    config: dict,
+    use_log: bool,
+    use_mape_loss: bool,
+    cv_method: Optional[str] = None,
+) -> tuple:
+    """월별 LSTM: 전체 pre-train → 월별 fine-tune. (OOF MAPE, oof_pred) 반환."""
+    from training.cv_splits import get_cv_folds
+    from training.deep_models import LSTMWrapper, _get_lag_sequence_cols, build_sequence_array
+
+    lstm_cfg = config.get("lstm", {})
+    seq_len_cfg = lstm_cfg.get("seq_len", 30)
+    seq_cols = _get_lag_sequence_cols(features, max_lag=seq_len_cfg)
+    if len(seq_cols) < 2:
+        return float("inf"), np.full(len(train_df), np.nan)
+
+    data = train_df.sort_values("date").reset_index(drop=True)
+    data = data[data[TARGET_COL].notna()].copy()
+    data = data.fillna(data[features].median())
+    data["_month"] = pd.to_datetime(data["date"].astype(str), format="%Y%m%d").dt.month
+    y = data[Y_TARGET_COL].values if Y_TARGET_COL in data.columns else data[TARGET_COL].values
+    y_orig = data[TARGET_COL].values
+    oof_pred = np.full(len(data), np.nan)
+    fold_mapes = []
+    cv_cfg = config.get("cv", {})
+    _cv_method = cv_method or cv_cfg.get("method", "expanding")
+    pretrain_epochs = lstm_cfg.get("pretrain_epochs", 100)
+    finetune_epochs = lstm_cfg.get("finetune_epochs", 30)
+    finetune_lr = lstm_cfg.get("finetune_lr", 0.0001)
+    finetune_patience = lstm_cfg.get("finetune_patience", 10)
+
+    fold_gen = get_cv_folds(
+        data,
+        method=_cv_method,
+        n_folds=cv_cfg.get("n_folds", 5),
+        n_splits=cv_cfg.get("n_folds", 5),
+        valid_days=cv_cfg.get("valid_days", 30),
+        purge_days=cv_cfg.get("purge_days", 7),
+        embargo_days=cv_cfg.get("embargo_days", 3),
+    )
+
+    for train_idx, valid_idx in fold_gen:
+        try:
+            X_seq_tr = build_sequence_array(data.iloc[train_idx], seq_cols)
+            X_seq_val = build_sequence_array(data.iloc[valid_idx], seq_cols)
+            y_tr = y[train_idx]
+            y_val_orig = y_orig[valid_idx]
+
+            # 1. Pre-train on full train
+            pretrained = LSTMWrapper(
+                seq_len=len(seq_cols),
+                hidden=lstm_cfg.get("hidden", 128),
+                layers=lstm_cfg.get("layers", 8),
+                epochs=pretrain_epochs,
+                patience=lstm_cfg.get("patience", 15),
+                dropout=lstm_cfg.get("dropout", 0.3),
+                use_mape_loss=use_mape_loss,
+            )
+            pretrained.fit(X_seq_tr, y_tr, X_val=X_seq_val, y_val=y_val_orig)
+
+            # 2. Fine-tune per month
+            models_by_month = {}
+            for month in range(1, 13):
+                mask = (data.iloc[train_idx]["_month"] == month).values
+                if mask.sum() < 15:
+                    continue
+                tr_idx = np.array(train_idx)[mask]
+                X_seq_m = build_sequence_array(data.iloc[tr_idx], seq_cols)
+                y_m = y[tr_idx]
+                m = LSTMWrapper(
+                    seq_len=len(seq_cols),
+                    hidden=lstm_cfg.get("hidden", 128),
+                    layers=lstm_cfg.get("layers", 8),
+                    epochs=finetune_epochs,
+                    lr=finetune_lr,
+                    patience=finetune_patience,
+                    dropout=lstm_cfg.get("dropout", 0.3),
+                    use_mape_loss=use_mape_loss,
+                )
+                m.fit_from_pretrained(X_seq_m, y_m, pretrained)
+                models_by_month[month] = m
+
+            if len(models_by_month) < 2:
+                continue
+            fallback_m = list(models_by_month.values())[0]
+            for i in valid_idx:
+                month = data.iloc[i]["_month"]
+                m = models_by_month.get(month, fallback_m)
+                x_seq = build_sequence_array(data.iloc[[i]], seq_cols)
+                oof_pred[i] = m.predict(x_seq)[0]
+            pred_orig = np.expm1(oof_pred[valid_idx]) if use_log else oof_pred[valid_idx]
+            valid_mask = np.isfinite(pred_orig) & np.isfinite(y_orig[valid_idx])
+            if valid_mask.sum() > 5:
+                fold_mapes.append(mape(y_orig[valid_idx][valid_mask], pred_orig[valid_mask]))
+        except Exception as e:
+            logger.warning("Monthly LSTM routing fold 실패: %s", str(e)[:50])
+
+    if not fold_mapes:
+        return float("inf"), oof_pred
+    return np.mean(fold_mapes), oof_pred
+
+
 def run_pipeline(
     data_path: Path = None,
     config_path: Path = None,
@@ -503,11 +674,13 @@ def run_pipeline(
     from training.split import train_test_split
     split_cfg = config.get("split", {})
     split_seed = seed if seed is not None else split_cfg.get("seed", RANDOM_STATE)
+    stratify_by = split_cfg.get("stratify_by", "month")  # month: 월별 균형 (다양한 년월), season: 계절 균형
     train_df, test_df, test_dates = train_test_split(
         df,
         test_days=split_cfg.get("test_days", 0),
         test_ratio=split_cfg.get("test_ratio", 0.1),
         seed=split_seed,
+        stratify_by=stratify_by,
     )
 
     # Target 전처리: outlier clip + log (MSE) or raw (MAPE)
@@ -653,6 +826,30 @@ def run_pipeline(
     except Exception as e:
         logger.warning("Seasonal routing CV 실패: %s", str(e)[:60])
 
+    # Monthly routing: 월별(1~12) LGBM 모델 → 월 기준 라우팅
+    monthly_oof_mape = float("inf")
+    try:
+        monthly_oof_mape, _ = _monthly_routing_cv(
+            train_df, features, config, use_log, use_mape_loss, use_gpu, cv_method,
+        )
+        if monthly_oof_mape < 1e9:
+            logger.info("Monthly routing (LGBM) OOF MAPE: %.2f%%", monthly_oof_mape)
+    except Exception as e:
+        logger.warning("Monthly routing CV 실패: %s", str(e)[:60])
+
+    # Monthly LSTM routing: pre-train 전체 → 월별 fine-tune
+    monthly_lstm_oof_mape = float("inf")
+    use_monthly_lstm = config.get("monthly_routing", {}).get("use_lstm", False)
+    if use_monthly_lstm and config.get("lstm", {}).get("enabled", True):
+        try:
+            monthly_lstm_oof_mape, _ = _monthly_routing_cv_lstm(
+                train_df, features, config, use_log, use_mape_loss, cv_method,
+            )
+            if monthly_lstm_oof_mape < 1e9:
+                logger.info("Monthly LSTM routing (pre-train→fine-tune) OOF MAPE: %.2f%%", monthly_lstm_oof_mape)
+        except Exception as e:
+            logger.warning("Monthly LSTM routing CV 실패: %s", str(e)[:60])
+
     # 단일 모델 best (앙상블보다 나쁠 수 있음)
     best_single = min(
         (k for k, v in model_scores.items() if v["mean"] < 1e9),
@@ -662,10 +859,14 @@ def run_pipeline(
     candidates = [
         (best_combo_mape, best_combo_name if use_stacking else None),
         (seasonal_oof_mape, "seasonal_routing"),
+        (monthly_oof_mape, "monthly_routing"),
+        (monthly_lstm_oof_mape, "monthly_lstm_routing"),
         (model_scores.get(best_single, {}).get("mean", 1e9), best_single),
     ]
     best_mape, best_name = min((m, n) for m, n in candidates if n is not None and m < 1e9)
     use_seasonal_routing = best_name == "seasonal_routing"
+    use_monthly_routing = best_name == "monthly_routing"
+    use_monthly_lstm_routing = best_name == "monthly_lstm_routing"
 
     # Final train on full train set
     train_full = train_df[train_df[TARGET_COL].notna()].fillna(train_df.median(numeric_only=True))
@@ -682,8 +883,109 @@ def run_pipeline(
     meta_for_checkpoint = None
     seq_cols_for_checkpoint: Optional[List[str]] = None
     seasonal_models_for_checkpoint: Optional[dict] = None
+    monthly_models_for_checkpoint: Optional[dict] = None
+    monthly_lstm_routing_for_checkpoint = False
 
-    if use_seasonal_routing:
+    if use_monthly_lstm_routing:
+        # 월별 LSTM: 전체 pre-train → 월별 fine-tune (12개)
+        train_full["_month"] = pd.to_datetime(train_full["date"].astype(str), format="%Y%m%d").dt.month
+        test_df = test_df.copy()
+        test_df["_month"] = pd.to_datetime(test_df["date"].astype(str), format="%Y%m%d").dt.month
+        try:
+            from training.deep_models import LSTMWrapper, _get_lag_sequence_cols, build_sequence_array
+            lstm_cfg = config.get("lstm", {})
+            seq_cols = _get_lag_sequence_cols(features, max_lag=lstm_cfg.get("seq_len", 30))
+            if len(seq_cols) >= 2:
+                X_seq_tr = build_sequence_array(train_full, seq_cols)
+                X_seq_te = build_sequence_array(test_df, seq_cols)
+                y_tr = train_full[Y_TARGET_COL].values if Y_TARGET_COL in train_full.columns else train_full[TARGET_COL].values
+                # 1. Pre-train
+                pretrained = LSTMWrapper(
+                    seq_len=len(seq_cols),
+                    hidden=lstm_cfg.get("hidden", 128),
+                    layers=lstm_cfg.get("layers", 8),
+                    epochs=lstm_cfg.get("pretrain_epochs", 100),
+                    patience=lstm_cfg.get("patience", 15),
+                    dropout=lstm_cfg.get("dropout", 0.3),
+                    use_mape_loss=use_mape_loss,
+                )
+                pretrained.fit(X_seq_tr, y_tr)
+                # 2. Fine-tune per month
+                monthly_models = {}
+                for month in range(1, 13):
+                    sub = train_full[train_full["_month"] == month]
+                    if len(sub) < 15:
+                        continue
+                    X_seq_m = build_sequence_array(sub, seq_cols)
+                    y_m = sub[Y_TARGET_COL].values if Y_TARGET_COL in sub.columns else sub[TARGET_COL].values
+                    m = LSTMWrapper(
+                        seq_len=len(seq_cols),
+                        hidden=lstm_cfg.get("hidden", 128),
+                        layers=lstm_cfg.get("layers", 8),
+                        epochs=lstm_cfg.get("finetune_epochs", 30),
+                        lr=lstm_cfg.get("finetune_lr", 0.0001),
+                        patience=lstm_cfg.get("finetune_patience", 10),
+                        dropout=lstm_cfg.get("dropout", 0.3),
+                        use_mape_loss=use_mape_loss,
+                    )
+                    m.fit_from_pretrained(X_seq_m, y_m, pretrained)
+                    monthly_models[month] = m
+                if monthly_models:
+                    pred_list = []
+                    fallback_m = list(monthly_models.values())[0]
+                    for idx in range(len(test_df)):
+                        month = test_df.iloc[idx]["_month"]
+                        m = monthly_models.get(month, fallback_m)
+                        pred_list.append(m.predict(X_seq_te[idx : idx + 1])[0])
+                    pred = np.array(pred_list)
+                    monthly_models_for_checkpoint = monthly_models
+                    seq_cols_for_checkpoint = seq_cols
+                    monthly_lstm_routing_for_checkpoint = True
+                    logger.info("Monthly LSTM routing 적용 (pre-train→fine-tune, %d개월)", len(monthly_models))
+            if pred is None:
+                use_monthly_lstm_routing = False
+                best_name = best_single
+        except Exception as e:
+            logger.warning("Monthly LSTM routing 실패: %s", str(e)[:80])
+            pred = None
+            use_monthly_lstm_routing = False
+            best_name = best_single
+    elif use_monthly_routing:
+        # 월별(1~12) 모델 학습 → test 시 월 기준 라우팅
+        train_full["_month"] = pd.to_datetime(train_full["date"].astype(str), format="%Y%m%d").dt.month
+        test_df = test_df.copy()
+        test_df["_month"] = pd.to_datetime(test_df["date"].astype(str), format="%Y%m%d").dt.month
+        try:
+            import lightgbm as lgb
+            from feature_selection.device_utils import fit_lgb_with_fallback
+            monthly_models = {}
+            for month in range(1, 13):
+                sub = train_full[train_full["_month"] == month]
+                if len(sub) < 20:
+                    continue
+                m = lgb.LGBMRegressor(**_lgb_params(config, use_gpu, use_mape_loss))
+                m = fit_lgb_with_fallback(m, sub[features], sub[Y_TARGET_COL] if Y_TARGET_COL in sub.columns else sub[TARGET_COL], "gpu" if use_gpu else "cpu")
+                monthly_models[month] = m
+            if monthly_models:
+                pred_list = []
+                fallback_m = list(monthly_models.values())[0]
+                for idx in range(len(test_df)):
+                    month = test_df.iloc[idx]["_month"]
+                    m = monthly_models.get(month, fallback_m)
+                    pred_list.append(m.predict(X_te.iloc[[idx]])[0])
+                pred = np.array(pred_list)
+                monthly_models_for_checkpoint = monthly_models
+                logger.info("Monthly routing 적용 (%d개월)", len(monthly_models))
+            else:
+                pred = None
+                use_monthly_routing = False
+                best_name = best_single
+        except Exception as e:
+            logger.warning("Monthly routing 실패: %s", str(e)[:60])
+            pred = None
+            use_monthly_routing = False
+            best_name = best_single
+    elif use_seasonal_routing:
         # 계절별 모델 학습 → test 시 월 기준 라우팅
         train_full["_month"] = pd.to_datetime(train_full["date"].astype(str), format="%Y%m%d").dt.month
         train_full["_season"] = train_full["_month"].apply(_month_to_season)
@@ -922,6 +1224,21 @@ def run_pipeline(
             for s, m in season_mape.items():
                 logger.info("  %s MAPE: %.2f%%", s, m)
 
+            # Per-month MAPE (월별 모델 평가용)
+            month_mape = {}
+            for m in range(1, 13):
+                mask = (test_df["_month"] == m) & test_df[TARGET_COL].notna() & np.isfinite(test_df["_pred"])
+                if mask.sum() > 0:
+                    month_mape[m] = mape(
+                        test_df.loc[mask, TARGET_COL].values,
+                        test_df.loc[mask, "_pred"].values,
+                    )
+            results["month_mape"] = month_mape
+            if month_mape:
+                logger.info("Per-month MAPE (월별 모델 성능):")
+                for m in sorted(month_mape):
+                    logger.info("  month %2d MAPE: %.2f%% (n=%d)", m, month_mape[m], (test_df["_month"] == m).sum())
+
             # 계절별 예측 사례 ~10개 (날짜, 실제가격, 예측가격)
             examples = []
             n_per_season = max(2, 10 // len(SEASON_MONTHS))
@@ -951,11 +1268,13 @@ def run_pipeline(
     results["best_model"] = best_name
     results["use_stacking"] = use_stacking
     results["use_seasonal_routing"] = use_seasonal_routing
+    results["use_monthly_routing"] = use_monthly_routing or use_monthly_lstm_routing
+    results["use_monthly_lstm_routing"] = use_monthly_lstm_routing
     results["n_features"] = len(features)
     results["test_dates"] = len(test_dates)
 
     # Save best model checkpoint for serving/inference
-    if pred is not None and (base_models_for_checkpoint or meta_for_checkpoint or seasonal_models_for_checkpoint):
+    if pred is not None and (base_models_for_checkpoint or meta_for_checkpoint or seasonal_models_for_checkpoint or monthly_models_for_checkpoint):
         try:
             import joblib
             CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
@@ -973,11 +1292,14 @@ def run_pipeline(
             ckpt = {
                 "use_stacking": use_stacking,
                 "use_seasonal_routing": use_seasonal_routing,
+                "use_monthly_routing": use_monthly_routing or use_monthly_lstm_routing,
+                "use_monthly_lstm_routing": use_monthly_lstm_routing,
                 "best_name": best_name,
                 "meta": meta_for_checkpoint,
                 "base_models": base_models_for_checkpoint,
                 "base_names": base_names,
                 "seasonal_models": seasonal_models_for_checkpoint,
+                "monthly_models": monthly_models_for_checkpoint,
                 "features": features,
                 "use_log": use_log,
                 "seq_cols": seq_cols_for_checkpoint,
@@ -1050,6 +1372,16 @@ def run_pipeline(
     ])
     for s, m in results.get("season_mape", {}).items():
         lines.append(f"| {s} | {m:.2f} |")
+    month_mape = results.get("month_mape", {})
+    if month_mape:
+        lines.extend([
+            "",
+            "## Month MAPE (월별 모델 성능)",
+            "| Month | MAPE (%) |",
+            "|-------|----------|",
+        ])
+        for m in sorted(month_mape):
+            lines.append(f"| {m} | {month_mape[m]:.2f} |")
     ex_list = results.get("prediction_examples", [])
     lines.extend([
         "",

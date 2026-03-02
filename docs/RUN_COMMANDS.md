@@ -54,7 +54,9 @@ python scripts/run_training_pipeline.py --skip-shap
 
 ## 4. Inference & Time Series Plot
 
-학습 후 체크포인트로 test 구간 inference 및 시계열 플롯 생성 (blue=actual train, red=predicted test):
+학습 후 체크포인트로 test 구간 inference 및 시계열 플롯 생성 (blue=actual train, red=predicted test).
+
+지원 모드: 단일/스태킹, 계절별 라우팅(4개), 월별 라우팅(12개). 체크포인트에 저장된 설정에 따라 자동 적용.
 
 ```bash
 python scripts/run_inference_and_plot.py

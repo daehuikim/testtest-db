@@ -70,15 +70,57 @@ def stratified_test_dates(
     return sorted(selected)
 
 
+def stratified_test_dates_by_month(
+    all_dates: pd.Series,
+    n_days: int = 70,
+    seed: int = 42,
+) -> List[str]:
+    """
+    전체 unique date에서 월별(1~12) 균형 있게 n_days개 선정.
+    각 월에서 비슷한 비율로 샘플링 → 다양한 년월 포함.
+    월별 모델 평가 시 test set에 1~12월 모두 포함.
+    seed 고정 시 동일 split 보장.
+    """
+    dates = pd.to_datetime(all_dates.astype(str), format="%Y%m%d", errors="coerce")
+    valid = dates.notna()
+    dates = dates[valid].dt.strftime("%Y%m%d").unique().tolist()
+    if not dates:
+        return []
+
+    df = pd.DataFrame({"date": dates})
+    df["dt"] = pd.to_datetime(df["date"], format="%Y%m%d")
+    df["month"] = df["dt"].dt.month
+
+    rng = np.random.default_rng(seed)
+    months = sorted(df["month"].unique().tolist())
+    if not months:
+        return []
+    n_per_month = max(1, n_days // len(months))
+    remainder = n_days - n_per_month * len(months)
+
+    selected = []
+    for i, m in enumerate(months):
+        pool = df[df["month"] == m]["date"].tolist()
+        n = n_per_month + (1 if i < remainder else 0)
+        n = min(n, len(pool))
+        if n > 0 and pool:
+            chosen = rng.choice(pool, size=n, replace=False)
+            selected.extend(chosen.tolist() if hasattr(chosen, "tolist") else [chosen])
+
+    return sorted(selected)
+
+
 def train_test_split(
     df: pd.DataFrame,
     test_days: int = 70,
     test_ratio: Optional[float] = 0.1,
     seed: int = 42,
+    stratify_by: str = "month",
 ) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
     """
     Train: 전체 데이터에서 test 날짜만 제외한 나머지 전부
-    Test: 전체 unique date에서 계절 균형 랜덤 ~test_days (seed 고정 시 split 고정)
+    Test: 전체 unique date에서 균형 랜덤 ~test_days (seed 고정 시 split 고정)
+    stratify_by: "month" (1~12월 균형, 월별 모델 평가용) | "season" (계절 균형)
 
     Returns: (train_df, test_df, test_date_list)
     """
@@ -90,8 +132,13 @@ def train_test_split(
     n_test = test_days if test_days > 0 else max(1, int(n_total * (test_ratio or 0.1)))
     n_test = min(n_test, n_total)
 
+    if stratify_by == "month":
+        test_date_list = stratified_test_dates_by_month(pd.Series(all_dates), n_days=n_test, seed=seed)
+        stratify_label = "월별 균형"
+    else:
+        test_date_list = stratified_test_dates(pd.Series(all_dates), n_days=n_test, seed=seed)
+        stratify_label = "계절 균형"
 
-    test_date_list = stratified_test_dates(pd.Series(all_dates), n_days=n_test, seed=seed)
     test_mask = df["date"].isin(test_date_list)
     train_mask = ~test_mask
 
@@ -99,12 +146,13 @@ def train_test_split(
     test_df = df[test_mask].copy()
 
     logger.info(
-        "Split (seed=%d): 전체 %d일 중 train %d rows (%d일), test %d rows (%d일, 계절 균형)",
+        "Split (seed=%d): 전체 %d일 중 train %d rows (%d일), test %d rows (%d일, %s)",
         seed,
         n_total,
         len(train_df),
         n_total - len(test_date_list),
         len(test_df),
         len(test_date_list),
+        stratify_label,
     )
     return train_df, test_df, test_date_list

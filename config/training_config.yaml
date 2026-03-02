@@ -15,7 +15,8 @@ feature_cluster:
 # seed 고정 시 split 고정 → 모델 비교 시 동일 split 사용
 split:
   test_days: 0                     # 0이면 test_ratio 사용
-  test_ratio: 0.1                  # 전체 unique date의 10% (계절 균형)
+  test_ratio: 0.1                  # 전체 unique date의 10%
+  stratify_by: "month"             # month: 1~12월 균형 (다양한 년월), season: 계절 균형
   seed: 42                          # split 고정 (바꾸면 다른 split)
 
 # 품종: 대표 품종 또는 최다 품종
@@ -84,19 +85,30 @@ stacking:
   meta_model: "ridge"
   include_lstm: false              # true면 LSTM OOF도 stacking에 포함 (다양한 앙상블)
 
+# 월별 라우팅: LGBM vs LSTM(pre-train + fine-tune)
+monthly_routing:
+  use_lstm: true                   # true면 LSTM pre-train→월별 fine-tune, false면 LGBM 월별
+
 # Deep 모델 (LSTM, Transformer) - eval, early stopping, checkpoint, dropout
+# seq_len: 월별 12개 모델 저장/불러 시 최근 30일 lag로 충분
+# monthly_prefinetune: 전체 pre-train → 월별 fine-tune (12개)
 lstm:
   enabled: true
-  seq_len: 365
-  hidden: 64
-  layers: 2
+  seq_len: 30
+  hidden: 128
+  layers: 8
   epochs: 150
   patience: 15
   dropout: 0.3
+  # 월별 pre-train + fine-tune용
+  pretrain_epochs: 100
+  finetune_epochs: 30
+  finetune_lr: 0.0001
+  finetune_patience: 10
 
 transformer:
   enabled: false         # MAPE 40%+ 수준으로 비활성화
-  seq_len: 365
+  seq_len: 30
   d_model: 32
   nhead: 4
   num_layers: 2
