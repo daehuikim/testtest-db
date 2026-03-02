@@ -83,18 +83,20 @@ stacking:
   meta_model: "ridge"
   include_lstm: false              # true면 LSTM OOF도 stacking에 포함 (다양한 앙상블)
 
-# Deep 모델 (LSTM, Transformer)
+# Deep 모델 (LSTM, Transformer) - eval, early stopping, checkpoint
 lstm:
   enabled: true
-  seq_len: 30
+  seq_len: 365
   hidden: 64
   layers: 2
-  epochs: 50
+  epochs: 100
+  patience: 10
 
 transformer:
   enabled: true
-  seq_len: 30
+  seq_len: 365
   d_model: 32
   nhead: 4
   num_layers: 2
-  epochs: 50
+  epochs: 100
+  patience: 10

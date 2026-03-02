@@ -7,8 +7,15 @@ import numpy as np
 
 
 def mape(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-8) -> float:
-    """Mean Absolute Percentage Error (%)"""
+    """Mean Absolute Percentage Error (%) - 원래 가격 스케일"""
     return np.mean(np.abs((y_true - y_pred) / (np.abs(y_true) + eps))) * 100
+
+
+def mape_log(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-8) -> float:
+    """MAPE on log scale (%) - 입력이 원래 가격 스케일일 때 log1p 변환 후 MAPE."""
+    log_true = np.log1p(np.maximum(y_true, 0))
+    log_pred = np.log1p(np.maximum(y_pred, eps))
+    return np.mean(np.abs((log_true - log_pred) / (np.abs(log_true) + eps))) * 100
 
 
 def mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -50,9 +57,10 @@ def compute_all_metrics(
     y_pred: np.ndarray,
     y_naive: np.ndarray = None,
 ) -> dict:
-    """모든 지표 계산."""
+    """모든 지표 계산 (원래 스케일 + 로그 스케일 MAPE)."""
     out = {
         "mape": mape(y_true, y_pred),
+        "mape_log": mape_log(y_true, y_pred),
         "mae": mae(y_true, y_pred),
         "rmse": rmse(y_true, y_pred),
         "r2": r2(y_true, y_pred),

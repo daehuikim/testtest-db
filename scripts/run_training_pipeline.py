@@ -145,7 +145,7 @@ def load_data_and_features(
     if report_path.exists():
         with open(report_path, encoding="utf-8") as f:
             report = json.load(f)
-        features = report.get("final_features", [])
+        features = report.get("final_features_ranked", report.get("final_features", []))
     # report에 feature가 너무 적으면 (<20) 데이터에서 전체 numeric 사용
     if not features or len(features) < 20:
         exclude = {"date", "품종", TARGET_COL, "price_per_kg_median", "price_per_kg_std"}
@@ -311,25 +311,32 @@ def expanding_cv_mape(
                 m.fit(X_tr, y_tr)
             elif model_name == "lstm":
                 from training.deep_models import LSTMWrapper, _get_lag_sequence_cols, build_sequence_array
-                seq_cols = _get_lag_sequence_cols(features, max_lag=config.get("lstm", {}).get("seq_len", 30))
-                if len(seq_cols) < 5:
+                seq_cols = _get_lag_sequence_cols(features, max_lag=config.get("lstm", {}).get("seq_len", 365))
+                if len(seq_cols) < 2:
                     continue
                 cfg = config.get("lstm", {})
                 X_seq_tr = build_sequence_array(data.iloc[train_idx], seq_cols)
                 X_seq_val = build_sequence_array(data.iloc[valid_idx], seq_cols)
-                m = LSTMWrapper(seq_len=len(seq_cols), hidden=cfg.get("hidden", 64), layers=cfg.get("layers", 2), epochs=cfg.get("epochs", 50))
-                m.fit(X_seq_tr, y_tr)
+                m = LSTMWrapper(
+                    seq_len=len(seq_cols), hidden=cfg.get("hidden", 64), layers=cfg.get("layers", 2),
+                    epochs=cfg.get("epochs", 50), patience=cfg.get("patience", 10),
+                )
+                m.fit(X_seq_tr, y_tr, X_val=X_seq_val, y_val=y_train[valid_idx])
                 pred_val = m.predict(X_seq_val)
             elif model_name == "transformer":
                 from training.deep_models import TransformerWrapper, _get_lag_sequence_cols, build_sequence_array
-                seq_cols = _get_lag_sequence_cols(features, max_lag=config.get("transformer", {}).get("seq_len", 30))
-                if len(seq_cols) < 5:
+                seq_cols = _get_lag_sequence_cols(features, max_lag=config.get("transformer", {}).get("seq_len", 365))
+                if len(seq_cols) < 2:
                     continue
                 cfg = config.get("transformer", {})
                 X_seq_tr = build_sequence_array(data.iloc[train_idx], seq_cols)
                 X_seq_val = build_sequence_array(data.iloc[valid_idx], seq_cols)
-                m = TransformerWrapper(seq_len=len(seq_cols), d_model=cfg.get("d_model", 32), nhead=cfg.get("nhead", 4), num_layers=cfg.get("num_layers", 2), epochs=cfg.get("epochs", 50))
-                m.fit(X_seq_tr, y_tr)
+                m = TransformerWrapper(
+                    seq_len=len(seq_cols), d_model=cfg.get("d_model", 32), nhead=cfg.get("nhead", 4),
+                    num_layers=cfg.get("num_layers", 2), epochs=cfg.get("epochs", 50),
+                    patience=cfg.get("patience", 10),
+                )
+                m.fit(X_seq_tr, y_tr, X_val=X_seq_val, y_val=y_train[valid_idx])
                 pred_val = m.predict(X_seq_val)
             else:
                 continue
@@ -495,21 +502,15 @@ def run_pipeline(
     logger.info("실행 모델: %s", model_list)
 
     model_scores = {}
-    oof_lgb, oof_cb, oof_lstm, oof_transformer = None, None, None, None
+    oof_dict = {}
     for name in model_list:
         try:
             mean_mape, std_mape, worst_mape, oof = expanding_cv_mape(
                 train_df, features, name, config, use_log=use_log, cv_method=cv_method,
             )
             model_scores[name] = {"mean": mean_mape, "std": std_mape, "worst": worst_mape}
-            if name == "lgb":
-                oof_lgb = oof
-            elif name == "catboost":
-                oof_cb = oof
-            elif name == "lstm":
-                oof_lstm = oof
-            elif name == "transformer":
-                oof_transformer = oof
+            if oof is not None and np.isfinite(oof).sum() > 10:
+                oof_dict[name] = oof
             logger.info("%s CV MAPE: %.2f%% ± %.2f (worst %.2f%%)", name, mean_mape, std_mape, worst_mape)
         except ImportError as e:
             logger.warning("%s 스킵: %s", name, str(e)[:50])
@@ -518,32 +519,52 @@ def run_pipeline(
 
     results["cv_scores"] = model_scores
 
-    # Stacking decision (LGB+CatBoost, 필요시 LSTM 포함)
-    use_stacking = False
-    stacking_oofs = []
-    if oof_lgb is not None and oof_cb is not None:
-        valid = np.isfinite(oof_lgb) & np.isfinite(oof_cb)
-        if valid.sum() > 10:
-            corr = np.corrcoef(oof_lgb[valid], oof_cb[valid])[0, 1]
-            thresh = config.get("stacking", {}).get("oof_corr_threshold", 0.95)
-            use_stacking = corr < thresh
-            stacking_oofs = [oof_lgb, oof_cb]
-            if use_stacking and config.get("stacking", {}).get("include_lstm") and oof_lstm is not None:
-                valid3 = valid & np.isfinite(oof_lstm)
-                if valid3.sum() > 10:
-                    stacking_oofs.append(oof_lstm)
-                    logger.info("LGBM vs CatBoost OOF corr: %.3f → 3-model stacking (LGB+CB+LSTM)", corr)
-                else:
-                    logger.info("LGBM vs CatBoost OOF corr: %.3f → stacking (LGB+CB)", corr)
-            else:
-                logger.info("LGBM vs CatBoost OOF corr: %.3f → stacking: %s", corr, use_stacking)
+    # 앙상블 탐색: 2~5 model 조합 중 OOF MAPE 최소인 것 선택
+    from itertools import combinations
+    from sklearn.linear_model import Ridge
 
-    # Best model selection
-    best_name = min(
+    data = train_df.sort_values("date").reset_index(drop=True)
+    data = data[data[TARGET_COL].notna()].copy()
+    y_orig = data[TARGET_COL].values
+
+    best_combo = None
+    best_combo_mape = float("inf")
+    best_combo_name = "lgb"
+
+    for r in range(2, min(6, len(oof_dict) + 1)):
+        for combo in combinations(oof_dict.keys(), r):
+            oofs = np.column_stack([oof_dict[m] for m in combo])
+            valid = np.all(np.isfinite(oofs), axis=1)
+            if valid.sum() < 20:
+                continue
+            meta = Ridge(alpha=1.0, random_state=RANDOM_STATE)
+            y_log = data[Y_TARGET_COL].values[valid] if Y_TARGET_COL in data.columns else data[TARGET_COL].values[valid]
+            meta.fit(oofs[valid], y_log)
+            oof_pred = meta.predict(oofs)
+            oof_pred_orig = np.expm1(oof_pred) if use_log else oof_pred
+            valid2 = np.isfinite(oof_pred_orig) & np.isfinite(y_orig)
+            if valid2.sum() < 20:
+                continue
+            mape_val = mape(y_orig[valid2], oof_pred_orig[valid2])
+            combo_name = "+".join(combo)
+            if mape_val < best_combo_mape:
+                best_combo_mape = mape_val
+                best_combo = list(combo)
+                best_combo_name = f"stacking({combo_name})"
+            logger.info("  앙상블 %s OOF MAPE: %.2f%%", combo_name, mape_val)
+
+    use_stacking = best_combo is not None and len(best_combo) >= 2
+    stacking_oofs = [oof_dict[m] for m in best_combo] if best_combo else []
+    if use_stacking:
+        logger.info("최적 앙상블: %s (OOF MAPE %.2f%%)", best_combo_name, best_combo_mape)
+
+    # 단일 모델 best (앙상블보다 나쁠 수 있음)
+    best_single = min(
         (k for k, v in model_scores.items() if v["mean"] < 1e9),
         key=lambda k: (model_scores[k]["mean"], model_scores[k]["std"]),
         default="lgb",
     )
+    best_name = best_combo_name if (use_stacking and best_combo_mape < model_scores.get(best_single, {}).get("mean", 1e9)) else best_single
 
     # Final train on full train set
     train_full = train_df[train_df[TARGET_COL].notna()].fillna(train_df.median(numeric_only=True))
@@ -556,46 +577,66 @@ def run_pipeline(
     final_model = None
     pred = None
 
-    if use_stacking and len(stacking_oofs) >= 2:
-        # Stacking: LGBM + CatBoost (+ LSTM) → Ridge meta
+    if use_stacking and best_combo and len(best_combo) >= 2:
+        # Stacking: best_combo 모델들 → Ridge meta
         import lightgbm as lgb
         import catboost as cb
         from sklearn.linear_model import Ridge
         from feature_selection.device_utils import fit_lgb_with_fallback
 
         preds_tr, preds_te = [], []
-        m_lgb = lgb.LGBMRegressor(**_lgb_params(config, use_gpu))
-        m_lgb = fit_lgb_with_fallback(m_lgb, X_tr, y_tr, "gpu" if use_gpu else "cpu")
-        preds_tr.append(m_lgb.predict(X_tr))
-        preds_te.append(m_lgb.predict(X_te))
-        try:
-            m_cb = cb.CatBoostRegressor(**_cb_params(config, use_gpu))
-            m_cb.fit(X_tr, y_tr)
-        except Exception as e:
-            if use_gpu and ("gpu" in str(e).lower() or "cuda" in str(e).lower() or "device" in str(e).lower()):
-                logger.warning("CatBoost GPU 실패, CPU fallback")
-                m_cb = cb.CatBoostRegressor(**_cb_params(config, False))
-                m_cb.fit(X_tr, y_tr)
-            else:
-                raise
-        preds_tr.append(m_cb.predict(X_tr))
-        preds_te.append(m_cb.predict(X_te))
-        if len(stacking_oofs) >= 3 and oof_lstm is not None:
-            from training.deep_models import LSTMWrapper, _get_lag_sequence_cols, build_sequence_array
-            seq_cols = _get_lag_sequence_cols(features, max_lag=config.get("lstm", {}).get("seq_len", 30))
-            if len(seq_cols) >= 5:
-                X_seq_tr = build_sequence_array(train_full, seq_cols)
-                X_seq_te = build_sequence_array(test_df, seq_cols)
-                cfg = config.get("lstm", {})
-                m_lstm = LSTMWrapper(seq_len=len(seq_cols), hidden=cfg.get("hidden", 64), layers=cfg.get("layers", 2), epochs=cfg.get("epochs", 50))
-                m_lstm.fit(X_seq_tr, y_tr.values)
-                preds_tr.append(m_lstm.predict(X_seq_tr))
-                preds_te.append(m_lstm.predict(X_seq_te))
-        meta = Ridge(alpha=1.0, random_state=RANDOM_STATE)
-        meta.fit(np.column_stack(preds_tr), y_tr)
-        pred = meta.predict(np.column_stack(preds_te))
-        best_name = "stacking"
-        logger.info("Stacking (%d models→Ridge) 적용", len(preds_tr))
+        for mname in best_combo:
+            if mname == "lgb":
+                m = lgb.LGBMRegressor(**_lgb_params(config, use_gpu))
+                m = fit_lgb_with_fallback(m, X_tr, y_tr, "gpu" if use_gpu else "cpu")
+                preds_tr.append(m.predict(X_tr))
+                preds_te.append(m.predict(X_te))
+            elif mname == "catboost":
+                try:
+                    m = cb.CatBoostRegressor(**_cb_params(config, use_gpu))
+                    m.fit(X_tr, y_tr)
+                except Exception as e:
+                    if use_gpu and ("gpu" in str(e).lower() or "cuda" in str(e).lower()):
+                        m = cb.CatBoostRegressor(**_cb_params(config, False))
+                        m.fit(X_tr, y_tr)
+                preds_tr.append(m.predict(X_tr))
+                preds_te.append(m.predict(X_te))
+            elif mname == "elasticnet":
+                from sklearn.linear_model import ElasticNet
+                m = ElasticNet(alpha=0.1, l1_ratio=0.5, random_state=RANDOM_STATE)
+                m.fit(X_tr, y_tr)
+                preds_tr.append(m.predict(X_tr))
+                preds_te.append(m.predict(X_te))
+            elif mname == "lstm":
+                from training.deep_models import LSTMWrapper, _get_lag_sequence_cols, build_sequence_array
+                seq_cols = _get_lag_sequence_cols(features, max_lag=config.get("lstm", {}).get("seq_len", 365))
+                if len(seq_cols) >= 2:
+                    cfg = config.get("lstm", {})
+                    X_seq_tr = build_sequence_array(train_full, seq_cols)
+                    X_seq_te = build_sequence_array(test_df, seq_cols)
+                    m = LSTMWrapper(seq_len=len(seq_cols), hidden=cfg.get("hidden", 64), layers=cfg.get("layers", 2), epochs=cfg.get("epochs", 50), patience=cfg.get("patience", 10))
+                    m.fit(X_seq_tr, y_tr.values)
+                    preds_tr.append(m.predict(X_seq_tr))
+                    preds_te.append(m.predict(X_seq_te))
+            elif mname == "transformer":
+                from training.deep_models import TransformerWrapper, _get_lag_sequence_cols, build_sequence_array
+                seq_cols = _get_lag_sequence_cols(features, max_lag=config.get("transformer", {}).get("seq_len", 365))
+                if len(seq_cols) >= 2:
+                    cfg = config.get("transformer", {})
+                    X_seq_tr = build_sequence_array(train_full, seq_cols)
+                    X_seq_te = build_sequence_array(test_df, seq_cols)
+                    m = TransformerWrapper(seq_len=len(seq_cols), d_model=cfg.get("d_model", 32), nhead=cfg.get("nhead", 4), num_layers=cfg.get("num_layers", 2), epochs=cfg.get("epochs", 50), patience=cfg.get("patience", 10))
+                    m.fit(X_seq_tr, y_tr.values)
+                    preds_tr.append(m.predict(X_seq_tr))
+                    preds_te.append(m.predict(X_seq_te))
+        if len(preds_tr) >= 2:
+            meta = Ridge(alpha=1.0, random_state=RANDOM_STATE)
+            meta.fit(np.column_stack(preds_tr), y_tr)
+            pred = meta.predict(np.column_stack(preds_te))
+            best_name = best_combo_name
+            logger.info("Stacking %s (%d models→Ridge) 적용", best_combo_name, len(preds_tr))
+        else:
+            use_stacking = False
     elif best_name == "lgb":
         import lightgbm as lgb
         from feature_selection.device_utils import fit_lgb_with_fallback
@@ -622,25 +663,41 @@ def run_pipeline(
         pred = final_model.predict(X_te) if valid_te.sum() > 0 else None
     elif best_name == "lstm":
         from training.deep_models import LSTMWrapper, _get_lag_sequence_cols, build_sequence_array
-        seq_cols = _get_lag_sequence_cols(features, max_lag=config.get("lstm", {}).get("seq_len", 30))
-        if len(seq_cols) >= 5:
+        seq_cols = _get_lag_sequence_cols(features, max_lag=config.get("lstm", {}).get("seq_len", 365))
+        if len(seq_cols) >= 2:
             cfg = config.get("lstm", {})
             X_seq_tr = build_sequence_array(train_full, seq_cols)
             X_seq_te = build_sequence_array(test_df, seq_cols)
-            final_model = LSTMWrapper(seq_len=len(seq_cols), hidden=cfg.get("hidden", 64), layers=cfg.get("layers", 2), epochs=cfg.get("epochs", 50))
-            final_model.fit(X_seq_tr, y_tr.values)
+            n = len(X_seq_tr)
+            if n > 100:
+                split = int(n * 0.8)
+                X_tr_sub, X_val_sub = X_seq_tr[:split], X_seq_tr[split:]
+                y_tr_sub, y_val_sub = y_tr.values[:split], y_tr.values[split:]
+                final_model = LSTMWrapper(seq_len=len(seq_cols), hidden=cfg.get("hidden", 64), layers=cfg.get("layers", 2), epochs=cfg.get("epochs", 100), patience=cfg.get("patience", 10))
+                final_model.fit(X_tr_sub, y_tr_sub, X_val=X_val_sub, y_val=y_val_sub)
+            else:
+                final_model = LSTMWrapper(seq_len=len(seq_cols), hidden=cfg.get("hidden", 64), layers=cfg.get("layers", 2), epochs=cfg.get("epochs", 100))
+                final_model.fit(X_seq_tr, y_tr.values)
             pred = final_model.predict(X_seq_te) if valid_te.sum() > 0 else None
         else:
             pred = None
     elif best_name == "transformer":
         from training.deep_models import TransformerWrapper, _get_lag_sequence_cols, build_sequence_array
-        seq_cols = _get_lag_sequence_cols(features, max_lag=config.get("transformer", {}).get("seq_len", 30))
-        if len(seq_cols) >= 5:
+        seq_cols = _get_lag_sequence_cols(features, max_lag=config.get("transformer", {}).get("seq_len", 365))
+        if len(seq_cols) >= 2:
             cfg = config.get("transformer", {})
             X_seq_tr = build_sequence_array(train_full, seq_cols)
             X_seq_te = build_sequence_array(test_df, seq_cols)
-            final_model = TransformerWrapper(seq_len=len(seq_cols), d_model=cfg.get("d_model", 32), nhead=cfg.get("nhead", 4), num_layers=cfg.get("num_layers", 2), epochs=cfg.get("epochs", 50))
-            final_model.fit(X_seq_tr, y_tr.values)
+            n = len(X_seq_tr)
+            if n > 100:
+                split = int(n * 0.8)
+                X_tr_sub, X_val_sub = X_seq_tr[:split], X_seq_tr[split:]
+                y_tr_sub, y_val_sub = y_tr.values[:split], y_tr.values[split:]
+                final_model = TransformerWrapper(seq_len=len(seq_cols), d_model=cfg.get("d_model", 32), nhead=cfg.get("nhead", 4), num_layers=cfg.get("num_layers", 2), epochs=cfg.get("epochs", 100), patience=cfg.get("patience", 10))
+                final_model.fit(X_tr_sub, y_tr_sub, X_val=X_val_sub, y_val=y_val_sub)
+            else:
+                final_model = TransformerWrapper(seq_len=len(seq_cols), d_model=cfg.get("d_model", 32), nhead=cfg.get("nhead", 4), num_layers=cfg.get("num_layers", 2), epochs=cfg.get("epochs", 100))
+                final_model.fit(X_seq_tr, y_tr.values)
             pred = final_model.predict(X_seq_te) if valid_te.sum() > 0 else None
         else:
             pred = None
@@ -659,6 +716,8 @@ def run_pipeline(
         results["test_mape"] = metrics["mape"]
         for k, v in metrics.items():
             logger.info("Test %s: %.4f", k, v)
+        if "mape_log" in metrics:
+            logger.info("Test MAPE (log scale): %.4f%%", metrics["mape_log"])
 
         # Per-season MAPE
         test_df = test_df.copy()
@@ -727,6 +786,8 @@ def run_pipeline(
     ])
     for k, v in results.get("test_metrics", {}).items():
         lines.append(f"| {k} | {v:.4f} |")
+    lines.append("")
+    lines.append("*(mape: 원래 가격 스케일, mape_log: log1p 변환 후 MAPE)*")
     if "test_metrics" not in results and isinstance(results.get("test_mape"), (int, float)):
         lines.append(f"| mape | {results['test_mape']:.4f} |")
     lines.extend([
