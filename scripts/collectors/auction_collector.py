@@ -83,7 +83,7 @@ def _fetch_single_date(
     current_date: date,
     whsal_cd_list: List[str],
     max_workers: int = 15,
-    min_sleep: float = 0.2,
+    min_sleep: float = 0.05,
 ) -> List[pd.DataFrame]:
     """한 날짜에 대해 모든 시장 병렬 조회"""
     date_string = current_date.strftime("%Y-%m-%d")
@@ -101,13 +101,34 @@ def _fetch_single_date(
             df = future.result()
             if df is not None:
                 date_dfs.append(df)
-            time.sleep(min_sleep)  # rate limit 완화
+            if min_sleep > 0:
+                time.sleep(min_sleep)  # rate limit 완화
 
     return date_dfs
 
 
+def _fetch_date_wrapper(
+    current_date: date,
+    whsal_cd_list: List[str],
+    max_workers: int,
+    min_sleep: float,
+) -> List[pd.DataFrame]:
+    """날짜별 조회 래퍼 (병렬 실행용)"""
+    date_dfs = _fetch_single_date(
+        current_date,
+        whsal_cd_list,
+        max_workers=max_workers,
+        min_sleep=min_sleep,
+    )
+    if not date_dfs:
+        date_dfs.append(
+            pd.DataFrame([_get_empty_data(current_date.strftime("%Y%m%d"))])
+        )
+    return date_dfs
+
+
 class AuctionCollector(BaseCollector):
-    """경매 데이터 수집기 - 날짜별 시장 병렬 처리"""
+    """경매 데이터 수집기 - 날짜별 병렬 + 시장별 병렬"""
 
     def __init__(
         self,
@@ -116,36 +137,40 @@ class AuctionCollector(BaseCollector):
         output_dir: str = "./data/raw/auction",
         whsal_cd_list: Optional[List[str]] = None,
         max_workers_per_date: int = 15,
-        min_sleep: float = 0.2,
+        max_workers_dates: int = 20,
+        min_sleep: float = 0.05,
         seed: int = 42,
     ):
         super().__init__(start_date, end_date, output_dir, seed)
         self.whsal_cd_list = whsal_cd_list or WHSAL_CD_LIST
         self.max_workers_per_date = max_workers_per_date
+        self.max_workers_dates = max_workers_dates
         self.min_sleep = min_sleep
 
     def collect(self) -> pd.DataFrame:
+        dates = list(self.date_range(self.start_date, self.end_date))
         all_dfs = []
-        total_days = (self.end_date - self.start_date).days + 1
 
-        for current_date in tqdm(
-            self.date_range(self.start_date, self.end_date),
-            total=total_days,
-            desc="auction (가락시장)",
-            unit="day",
-            unit_scale=False,
-        ):
-            date_dfs = _fetch_single_date(
-                current_date,
-                self.whsal_cd_list,
-                max_workers=self.max_workers_per_date,
-                min_sleep=self.min_sleep,
-            )
-            if not date_dfs:
-                date_dfs.append(
-                    pd.DataFrame([_get_empty_data(current_date.strftime("%Y%m%d"))])
-                )
-            all_dfs.extend(date_dfs)
+        with ThreadPoolExecutor(max_workers=self.max_workers_dates) as executor:
+            futures = {
+                executor.submit(
+                    _fetch_date_wrapper,
+                    d,
+                    self.whsal_cd_list,
+                    self.max_workers_per_date,
+                    self.min_sleep,
+                ): d
+                for d in dates
+            }
+            for future in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc="auction (가락시장)",
+                unit="day",
+                unit_scale=False,
+            ):
+                date_dfs = future.result()
+                all_dfs.extend(date_dfs)
 
         if not all_dfs:
             return pd.DataFrame()

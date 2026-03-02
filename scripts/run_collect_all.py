@@ -143,6 +143,11 @@ def main():
         action="store_true",
         help="수집 후 combine_raw_data 실행하여 시계열 통합",
     )
+    parser.add_argument(
+        "--combine-only",
+        action="store_true",
+        help="수집 생략, 기존 raw 데이터만 combine (데이터 있을 때)",
+    )
     args = parser.parse_args()
 
     start = date.fromisoformat(args.start)
@@ -152,6 +157,22 @@ def main():
 
     logger.info("수집 기간: %s ~ %s", start, end)
     logger.info("출력 디렉터리: %s", output_dir)
+
+    if args.combine_only:
+        logger.info("combine만 실행 (수집 생략)")
+        start_str = start.strftime("%Y%m%d")
+        end_str = end.strftime("%Y%m%d")
+        output_path = output_dir / "combined" / "raw_combined.csv"
+        try:
+            from combine_raw_data import combine
+            result = combine(output_dir, start_str, end_str, output_path)
+            if result.empty:
+                logger.warning("통합할 데이터 없음 (data/raw/*.csv 확인 필요)")
+            else:
+                logger.info("통합 완료: %s (%d행)", output_path, len(result))
+        except Exception as e:
+            logger.exception("통합 실패: %s", e)
+        return
 
     all_tasks = [
         ("auction", lambda: run_auction(start, end, output_dir)),
