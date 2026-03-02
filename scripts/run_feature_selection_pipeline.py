@@ -131,10 +131,14 @@ def run_pipeline(
         try:
             sys.path.insert(0, str(SCRIPT_DIR))
             from training.feature_cluster import reduce_by_lag_representative
+            seasonal_cfg = config.get("seasonal_lags", {})
+            seasonal_list = seasonal_cfg.get("lags", [364, 365, 366]) if isinstance(seasonal_cfg, dict) else [364, 365, 366]
             features = reduce_by_lag_representative(
                 df, features,
                 target_col="price_per_kg_mean",
                 top_k_per_base=cluster_cfg.get("top_k_per_base", 1),
+                max_final=cluster_cfg.get("max_final", 50),
+                seasonal_lags=seasonal_list,
                 use_gpu=config.get("use_gpu", False),
                 random_state=42,
             )

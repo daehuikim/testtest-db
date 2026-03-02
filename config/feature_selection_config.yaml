@@ -3,6 +3,11 @@
 
 use_gpu: true  # LightGBM GPU 가속 (CUDA 필요)
 
+# 데이터 기간 (수집 파일명과 일치: auction_20200101_20251231.csv 등)
+data_range:
+  start: "20200101"
+  end: "20251231"
+
 # Popular 품종만 사용 (하나만 설정)
 variety_filter:
   min_pct: 1.0        # 전체 대비 N% 이상 품종만 (null이면 전체)
@@ -13,6 +18,11 @@ lag_depths:
   target_price: 60   # price_per_kg_mean lag 1~60 (autoregressive)
   domae_somae: 30    # 도매/소매 lag 1~30
   weather: 21        # 날씨 lag 1~21
+
+# 연간 계절성 (Year-over-Year) - 별도 관리, feature selection에서 항상 포함
+seasonal_lags:
+  enabled: true
+  lags: [364, 365, 366]   # 1년 전 ±1일 (윤년 대응)
 
 rolling_windows:
   - 7
@@ -48,7 +58,9 @@ stage5_common:
   top_k_per_variety: 80    # 상위 80개 고려
   min_kept: 20             # 최소 20개 유지
 
-# Stage 6: Lag clustering (base별 대표 lag 1개)
+# Stage 6: Lag clustering (base별 대표 lag 1개, 최종 50개 미만)
 feature_cluster:
   enabled: true
   top_k_per_base: 1
+  max_final: 50
+  # seasonal_lags(364,365,366)는 clustering에서 제외하고 항상 유지

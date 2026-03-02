@@ -30,21 +30,31 @@ def reduce_by_lag_representative(
     features: List[str],
     target_col: str = "price_per_kg_mean",
     top_k_per_base: int = 1,
+    max_final: int = 50,
+    seasonal_lags: Optional[List[int]] = None,
     use_gpu: bool = True,
     random_state: int = 42,
 ) -> List[str]:
     """
     base별로 그룹화 후 LGBM importance 기준 상위 top_k_per_base개만 유지.
+    seasonal_lags(364,365,366 등)는 clustering 제외, 항상 유지.
     """
     try:
         import lightgbm as lgb
     except ImportError:
         return features
 
-    # Group by base
+    seasonal_lags = seasonal_lags or [364, 365, 366]
+    seasonal_feature_names = [f"price_per_kg_mean_lag{d}" for d in seasonal_lags]
+
+    # Group by base (seasonal은 제외하고 clustering)
     groups: dict[str, List[str]] = defaultdict(list)
     no_lag: List[str] = []
+    always_keep: List[str] = []
     for f in features:
+        if f in seasonal_feature_names:
+            always_keep.append(f)
+            continue
         base, lag = _parse_feature(f)
         if lag is None:
             no_lag.append(f)
@@ -97,12 +107,21 @@ def reduce_by_lag_representative(
         if len(feats) == 1:
             to_keep.append(feats[0])
 
-    kept = list(dict.fromkeys(to_keep))  # preserve order, no dupes
+    kept = list(dict.fromkeys(always_keep + to_keep))  # seasonal 먼저
+    if max_final > 0 and len(kept) > max_final:
+        # seasonal 유지 + 나머지 중 importance 상위
+        rest = [f for f in kept if f not in always_keep]
+        n_rest = max(0, max_final - len(always_keep))
+        if n_rest < len(rest):
+            imp_rest = imp.reindex(rest).fillna(0)
+            rest = imp_rest.nlargest(n_rest).index.tolist()
+        kept = always_keep + rest
     logger.info(
-        "Lag clustering: %d -> %d (base %d개, 다중 lag %d개 그룹)",
+        "Lag clustering: %d -> %d (base %d개, seasonal %d개, max_final=%d)",
         len(features),
         len(kept),
         len(groups) + (1 if no_lag else 0),
-        len(multi_lag_bases),
+        len(always_keep),
+        max_final,
     )
     return kept

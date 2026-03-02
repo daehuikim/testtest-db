@@ -55,19 +55,20 @@ class DataMerger:
     def __init__(
         self,
         data_root: Path,
-        start: str = "20240101",
-        end: str = "20251231",
+        start: str = None,
+        end: str = None,
         config: Optional[dict] = None,
     ):
         self.data_root = Path(data_root)
-        self.start = start
-        self.end = end
-        cfg = config or load_config()
-        lag = cfg.get("lag_depths", DEFAULT_LAG)
+        self._config = config or load_config()
+        dr = self._config.get("data_range", {})
+        self.start = start or dr.get("start", "20200101")
+        self.end = end or dr.get("end", "20251231")
+        lag = self._config.get("lag_depths", DEFAULT_LAG)
         self.target_lag = lag.get("target_price", 60)
         self.domae_somae_lag = lag.get("domae_somae", 30)
         self.weather_lag = lag.get("weather", 21)
-        self.rolling_windows = cfg.get("rolling_windows", ROLLING_WINDOWS)
+        self.rolling_windows = self._config.get("rolling_windows", ROLLING_WINDOWS)
 
     def _normalize_date(self, s: pd.Series) -> pd.Series:
         return s.astype(str).str.replace(r"\D", "", regex=True).str[:8].str.zfill(8)
@@ -219,6 +220,26 @@ class DataMerger:
             min(self.target_lag, 60),
             ("date", "품종"),
         )
+
+        # Seasonal lags (Year-over-Year): 364, 365, 366 - 별도 관리
+        seasonal_cfg = self._config.get("seasonal_lags", {})
+        if seasonal_cfg.get("enabled", True):
+            seasonal_list = seasonal_cfg.get("lags", [364, 365, 366])
+            for lag_d in seasonal_list:
+                if lag_d <= 60:
+                    continue  # 이미 target_lag에 포함
+                lag_src = target_src.copy()
+                lag_src["_join_date"] = (
+                    pd.to_datetime(lag_src["date"], format="%Y%m%d") + pd.Timedelta(days=lag_d)
+                ).dt.strftime("%Y%m%d")
+                lag_src = lag_src.rename(columns={"price_per_kg_mean": f"price_per_kg_mean_lag{lag_d}"})
+                merged = merged.merge(
+                    lag_src[["_join_date", "품종", f"price_per_kg_mean_lag{lag_d}"]],
+                    left_on=["date", "품종"],
+                    right_on=["_join_date", "품종"],
+                    how="left",
+                ).drop(columns=["_join_date"], errors="ignore")
+            logger.info("Seasonal lags 추가: %s", seasonal_list)
 
         domae = self.load_domae()
         domae_agg = self._aggregate_domae_somae(domae, "domae") if not domae.empty else None

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-2024-01-01 ~ 2025-12-31 전체 데이터 수집 통합 스크립트
+2020-01-01 ~ 2025-12-31 전체 데이터 수집 통합 스크립트
 
 - auction, somae, domae, weather를 병렬로 수집
 - 각 소스별 병렬 처리 적용 (auction: 시장별, somae/domae: 날짜별, weather: 월별)
@@ -51,7 +51,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEFAULT_START = date(2024, 1, 1)
+DEFAULT_START = date(2020, 1, 1)
 DEFAULT_END = date(2025, 12, 31)
 DATA_ROOT = PROJECT_ROOT / "data" / "raw"
 
@@ -100,11 +100,11 @@ def run_weather(start: date, end: date, output_dir: Path) -> Path:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="전체 데이터 수집 (2024-01-01 ~ 2025-12-31)")
+    parser = argparse.ArgumentParser(description="전체 데이터 수집 (2020-01-01 ~ 2025-12-31)")
     parser.add_argument(
         "--start",
         type=str,
-        default="2024-01-01",
+        default="2020-01-01",
         help="시작일 (YYYY-MM-DD)",
     )
     parser.add_argument(

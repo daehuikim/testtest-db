@@ -3,10 +3,12 @@
 
 use_gpu: true  # LGBM, CatBoost GPU 가속
 
-# Lag feature clustering (base별 대표 lag 1개)
+# Lag feature clustering (base별 대표 lag 1개, 최종 50개 미만)
 feature_cluster:
   enabled: true
-  top_k_per_base: 1   # base당 상위 1개 lag만 유지
+  top_k_per_base: 1
+  max_final: 50
+  seasonal_lags: [364, 365, 366]  # 항상 유지 (feature_selection과 동일)
 
 # 데이터 분할
 # Train: 전체 데이터에서 test ~70일만 제외한 나머지 전부
@@ -17,11 +19,18 @@ split:
   test_ratio: 0.1                 # test_days=0이면 unique date의 10%
   seed: 42                         # split 고정 (바꾸면 다른 split)
 
-# Expanding Walk-forward CV (Train 내부)
+# 품종: 최다 품종만 예측 (보고서에 품종 정보 포함)
+variety:
+  use_top_only: true   # true면 최다 품종만 학습/예측
+  top_n: 1             # 상위 N개 품종 (1=최다만)
+
+# CV 방법: expanding, timeseries, purged
 cv:
+  method: "purged"     # expanding | timeseries | purged
   valid_days: 30
   n_folds: 5
-  # Fold 예: (train_end, valid) = (2024-09, 2024-10), (2024-10, 2024-11), ...
+  purge_days: 7        # purged용
+  embargo_days: 3      # purged용
 
 # Feature 재정제 (SHAP)
 feature_refine:
@@ -29,6 +38,11 @@ feature_refine:
   min_rank_corr: 0.4
   max_final: 60
   min_final: 40
+
+# Target 전처리
+target:
+  use_log: true          # log1p(price) 학습 → expm1 복원 후 MAPE
+  outlier_clip_pct: 1.0  # 상/하위 1% clip (spike 제거)
 
 # Baseline
 baseline:
@@ -62,3 +76,19 @@ elasticnet:
 stacking:
   oof_corr_threshold: 0.95         # LGBM vs CatBoost OOF corr < 이면 stacking
   meta_model: "ridge"
+
+# Deep 모델 (LSTM, Transformer)
+lstm:
+  enabled: true
+  seq_len: 30
+  hidden: 64
+  layers: 2
+  epochs: 50
+
+transformer:
+  enabled: true
+  seq_len: 30
+  d_model: 32
+  nhead: 4
+  num_layers: 2
+  epochs: 50

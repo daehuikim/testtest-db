@@ -50,6 +50,42 @@ def mape(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-8) -> float:
     return np.mean(np.abs((y_true - y_pred) / (np.abs(y_true) + eps))) * 100
 
 
+Y_TARGET_COL = "_y_target"  # 학습용 (log1p 또는 raw)
+
+
+def preprocess_target(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    target_col: str,
+    clip_pct: float = 1.0,
+    use_log: bool = True,
+) -> tuple:
+    """
+    Outlier clip + log 변환.
+    train 기준으로 clip 구간 계산 후 train/test 동일 적용.
+    Returns: (train_df, test_df) with _y_target 추가
+    """
+    train_df = train_df.copy()
+    test_df = test_df.copy()
+    valid = train_df[target_col].notna()
+    if valid.sum() < 10:
+        train_df[Y_TARGET_COL] = train_df[target_col]
+        test_df[Y_TARGET_COL] = test_df[target_col]
+        return train_df, test_df
+
+    lo = np.percentile(train_df.loc[valid, target_col], clip_pct)
+    hi = np.percentile(train_df.loc[valid, target_col], 100 - clip_pct)
+    train_df[target_col] = train_df[target_col].clip(lo, hi)
+    test_df[target_col] = test_df[target_col].clip(lo, hi)
+    if use_log:
+        train_df[Y_TARGET_COL] = np.log1p(train_df[target_col])
+        test_df[Y_TARGET_COL] = np.log1p(test_df[target_col])
+    else:
+        train_df[Y_TARGET_COL] = train_df[target_col]
+        test_df[Y_TARGET_COL] = test_df[target_col]
+    return train_df, test_df
+
+
 def _lgb_params(config: dict, use_gpu: bool) -> dict:
     cfg = config.get("lgb", {})
     p = dict(
@@ -172,7 +208,7 @@ def refine_features_shap(
     data = train_df.sort_values("date").reset_index(drop=True)
     data = data[data[TARGET_COL].notna()].fillna(data.median(numeric_only=True))
     X = data[features]
-    y = data[TARGET_COL]
+    y = data[Y_TARGET_COL] if Y_TARGET_COL in data.columns else data[TARGET_COL]
 
     ranks_per_fold = []
     for train_idx, valid_idx in expanding_walk_fold_indices(
@@ -216,26 +252,39 @@ def expanding_cv_mape(
     features: list,
     model_name: str,
     config: dict,
+    use_log: bool = False,
 ) -> tuple:
-    """Expanding CV로 MAPE 평균, std, worst fold 반환. OOF 예측도 반환 (stacking용)."""
-    from training.cv import expanding_walk_fold_indices
+    """CV로 MAPE 평균, std, worst fold 반환. OOF 예측도 반환 (stacking용)."""
+    from training.cv_splits import get_cv_folds
 
     data = train_df.sort_values("date").reset_index(drop=True)
     data = data[data[TARGET_COL].notna()].copy()
     data = data.fillna(data[features].median())
     X = data[features]
-    y = data[TARGET_COL].values
+    y_train = data[Y_TARGET_COL].values if Y_TARGET_COL in data.columns else data[TARGET_COL].values
+    y_orig = data[TARGET_COL].values  # metrics용
 
     oof_pred = np.full(len(data), np.nan)
     fold_mapes = []
-
     use_gpu = config.get("use_gpu", False)
-    for train_idx, valid_idx in expanding_walk_fold_indices(
-        data, n_folds=config.get("cv", {}).get("n_folds", 5),
-        valid_days=config.get("cv", {}).get("valid_days", 30),
-    ):
-        X_tr, y_tr = X.iloc[train_idx], y[train_idx]
-        X_val, y_val = X.iloc[valid_idx], y[valid_idx]
+    cv_cfg = config.get("cv", {})
+    _cv_method = cv_method or cv_cfg.get("method", "expanding")
+    config["cv"] = {**cv_cfg, "method": _cv_method}
+
+    fold_gen = get_cv_folds(
+        data,
+        method=cv_cfg.get("method", "expanding"),
+        n_folds=cv_cfg.get("n_folds", 5),
+        n_splits=cv_cfg.get("n_folds", 5),
+        valid_days=cv_cfg.get("valid_days", 30),
+        purge_days=cv_cfg.get("purge_days", 7),
+        embargo_days=cv_cfg.get("embargo_days", 3),
+    )
+
+    for train_idx, valid_idx in fold_gen:
+        X_tr, y_tr = X.iloc[train_idx], y_train[train_idx]
+        X_val = X.iloc[valid_idx]
+        y_val_orig = y_orig[valid_idx]
 
         try:
             if model_name == "lgb":
@@ -259,12 +308,36 @@ def expanding_cv_mape(
                 from sklearn.linear_model import ElasticNet
                 m = ElasticNet(alpha=0.1, l1_ratio=0.5, random_state=RANDOM_STATE)
                 m.fit(X_tr, y_tr)
+            elif model_name == "lstm":
+                from training.deep_models import LSTMWrapper, _get_lag_sequence_cols, build_sequence_array
+                seq_cols = _get_lag_sequence_cols(features, max_lag=config.get("lstm", {}).get("seq_len", 30))
+                if len(seq_cols) < 5:
+                    continue
+                cfg = config.get("lstm", {})
+                X_seq_tr = build_sequence_array(data.iloc[train_idx], seq_cols)
+                X_seq_val = build_sequence_array(data.iloc[valid_idx], seq_cols)
+                m = LSTMWrapper(seq_len=len(seq_cols), hidden=cfg.get("hidden", 64), layers=cfg.get("layers", 2), epochs=cfg.get("epochs", 50))
+                m.fit(X_seq_tr, y_tr)
+                pred_val = m.predict(X_seq_val)
+            elif model_name == "transformer":
+                from training.deep_models import TransformerWrapper, _get_lag_sequence_cols, build_sequence_array
+                seq_cols = _get_lag_sequence_cols(features, max_lag=config.get("transformer", {}).get("seq_len", 30))
+                if len(seq_cols) < 5:
+                    continue
+                cfg = config.get("transformer", {})
+                X_seq_tr = build_sequence_array(data.iloc[train_idx], seq_cols)
+                X_seq_val = build_sequence_array(data.iloc[valid_idx], seq_cols)
+                m = TransformerWrapper(seq_len=len(seq_cols), d_model=cfg.get("d_model", 32), nhead=cfg.get("nhead", 4), num_layers=cfg.get("num_layers", 2), epochs=cfg.get("epochs", 50))
+                m.fit(X_seq_tr, y_tr)
+                pred_val = m.predict(X_seq_val)
             else:
                 continue
 
-            pred = m.predict(X_val)
-            oof_pred[valid_idx] = pred
-            fold_mapes.append(mape(y_val, pred))
+            if model_name not in ("lstm", "transformer"):
+                pred_val = m.predict(X_val)
+            oof_pred[valid_idx] = pred_val  # stacking용 (log scale 유지)
+            pred_for_mape = np.expm1(pred_val) if use_log else pred_val
+            fold_mapes.append(mape(y_val_orig, pred_for_mape))
         except Exception as e:
             logger.warning("Fold 실패 (%s): %s", model_name, str(e)[:50])
 
@@ -279,6 +352,9 @@ def run_pipeline(
     seed: Optional[int] = None,
     skip_feature_refine: bool = False,
     skip_shap: bool = True,
+    models: Optional[list] = None,
+    cv_method: Optional[str] = None,
+    no_deep: bool = False,
 ) -> dict:
     """전체 파이프라인 실행."""
     config_path = config_path or PROJECT_ROOT / "config" / "training_config.yaml"
@@ -299,6 +375,21 @@ def run_pipeline(
     if len(features) < 5:
         logger.warning("Feature 수 부족. feature selection pipeline 먼저 실행 권장.")
 
+    # 품종: 최다 품종만 예측
+    variety_cfg = config.get("variety", {})
+    top_variety = None
+    variety_info = {}
+    if variety_cfg.get("use_top_only", True) and "품종" in df.columns:
+        cnt = df["품종"].value_counts()
+        top_n = variety_cfg.get("top_n", 1)
+        top_varieties = cnt.head(top_n).index.tolist()
+        df = df[df["품종"].isin(top_varieties)].copy()
+        variety_info = {v: int(cnt[v]) for v in top_varieties}
+        top_variety = top_varieties[0] if len(top_varieties) == 1 else ", ".join(top_varieties)
+        logger.info("예측 품종: %s (최다 %d개, 샘플수: %s)", top_varieties, top_n, variety_info)
+
+    results = {"variety": top_variety, "variety_counts": variety_info}
+
     from training.split import train_test_split
     split_cfg = config.get("split", {})
     split_seed = seed if seed is not None else split_cfg.get("seed", RANDOM_STATE)
@@ -308,6 +399,19 @@ def run_pipeline(
         test_ratio=split_cfg.get("test_ratio"),
         seed=split_seed,
     )
+
+    # Target 전처리: outlier clip + log
+    target_cfg = config.get("target", {})
+    use_log = target_cfg.get("use_log", True)
+    clip_pct = target_cfg.get("outlier_clip_pct", 1.0)
+    train_df, test_df = preprocess_target(
+        train_df, test_df, TARGET_COL,
+        clip_pct=clip_pct, use_log=use_log,
+    )
+    if use_log:
+        logger.info("Target: log1p(price) 학습, expm1 복원 후 평가")
+    if clip_pct > 0:
+        logger.info("Outlier clip: 상/하위 %.1f%%", clip_pct)
 
     # Baseline
     baseline_results = run_baselines(train_df, test_df, features)
@@ -321,8 +425,10 @@ def run_pipeline(
         features = reduce_by_lag_representative(
             train_df,
             features,
-            target_col=TARGET_COL,
+            target_col=Y_TARGET_COL if Y_TARGET_COL in train_df.columns else TARGET_COL,
             top_k_per_base=cluster_cfg.get("top_k_per_base", 1),
+            max_final=cluster_cfg.get("max_final", 50),
+            seasonal_lags=cluster_cfg.get("seasonal_lags", [364, 365, 366]),
             use_gpu=use_gpu,
             random_state=RANDOM_STATE,
         )
@@ -337,8 +443,9 @@ def run_pipeline(
             import lightgbm as lgb
             from feature_selection.device_utils import fit_lgb_with_fallback
             tr = train_df[train_df[TARGET_COL].notna()].fillna(train_df.median(numeric_only=True))
+            y_tr = tr[Y_TARGET_COL] if Y_TARGET_COL in tr.columns else tr[TARGET_COL]
             m = lgb.LGBMRegressor(n_estimators=100, max_depth=5, verbosity=-1, random_state=RANDOM_STATE, device="gpu" if use_gpu else "cpu")
-            m = fit_lgb_with_fallback(m, tr[features], tr[TARGET_COL], "gpu" if use_gpu else "cpu")
+            m = fit_lgb_with_fallback(m, tr[features], y_tr, "gpu" if use_gpu else "cpu")
             imp = pd.Series(m.feature_importances_, index=features).nlargest(60)
             features = imp.index.tolist()
             logger.info("Feature 상위 60개 (LGBM importance) 사용")
@@ -346,13 +453,23 @@ def run_pipeline(
             logger.warning("Feature refine 실패: %s → 상위 60개", str(e)[:40])
             features = features[:60]
 
-    # Model comparison
+    # Model comparison (다양한 모델)
+    if models:
+        model_list = list(models)
+    else:
+        model_list = ["lgb", "catboost", "elasticnet"]
+        if not no_deep:
+            if config.get("lstm", {}).get("enabled", True):
+                model_list.append("lstm")
+            if config.get("transformer", {}).get("enabled", True):
+                model_list.append("transformer")
+
     model_scores = {}
     oof_lgb, oof_cb = None, None
-    for name in ["lgb", "catboost", "elasticnet"]:
+    for name in model_list:
         try:
             mean_mape, std_mape, worst_mape, oof = expanding_cv_mape(
-                train_df, features, name, config
+                train_df, features, name, config, use_log=use_log,
             )
             model_scores[name] = {"mean": mean_mape, "std": std_mape, "worst": worst_mape}
             if name == "lgb":
@@ -385,9 +502,9 @@ def run_pipeline(
     # Final train on full train set
     train_full = train_df[train_df[TARGET_COL].notna()].fillna(train_df.median(numeric_only=True))
     X_tr = train_full[features]
-    y_tr = train_full[TARGET_COL]
+    y_tr = train_full[Y_TARGET_COL] if Y_TARGET_COL in train_full.columns else train_full[TARGET_COL]
     X_te = test_df[features].fillna(train_full[features].median())
-    y_te = test_df[TARGET_COL].values
+    y_te = test_df[TARGET_COL].values  # metrics용 원본
     valid_te = np.isfinite(y_te)
 
     final_model = None
@@ -445,15 +562,49 @@ def run_pipeline(
         final_model = ElasticNet(alpha=0.1, l1_ratio=0.5, random_state=RANDOM_STATE)
         final_model.fit(X_tr, y_tr)
         pred = final_model.predict(X_te) if valid_te.sum() > 0 else None
+    elif best_name == "lstm":
+        from training.deep_models import LSTMWrapper, _get_lag_sequence_cols, build_sequence_array
+        seq_cols = _get_lag_sequence_cols(features, max_lag=config.get("lstm", {}).get("seq_len", 30))
+        if len(seq_cols) >= 5:
+            cfg = config.get("lstm", {})
+            X_seq_tr = build_sequence_array(train_full, seq_cols)
+            X_seq_te = build_sequence_array(test_df, seq_cols)
+            final_model = LSTMWrapper(seq_len=len(seq_cols), hidden=cfg.get("hidden", 64), layers=cfg.get("layers", 2), epochs=cfg.get("epochs", 50))
+            final_model.fit(X_seq_tr, y_tr.values)
+            pred = final_model.predict(X_seq_te) if valid_te.sum() > 0 else None
+        else:
+            pred = None
+    elif best_name == "transformer":
+        from training.deep_models import TransformerWrapper, _get_lag_sequence_cols, build_sequence_array
+        seq_cols = _get_lag_sequence_cols(features, max_lag=config.get("transformer", {}).get("seq_len", 30))
+        if len(seq_cols) >= 5:
+            cfg = config.get("transformer", {})
+            X_seq_tr = build_sequence_array(train_full, seq_cols)
+            X_seq_te = build_sequence_array(test_df, seq_cols)
+            final_model = TransformerWrapper(seq_len=len(seq_cols), d_model=cfg.get("d_model", 32), nhead=cfg.get("nhead", 4), num_layers=cfg.get("num_layers", 2), epochs=cfg.get("epochs", 50))
+            final_model.fit(X_seq_tr, y_tr.values)
+            pred = final_model.predict(X_seq_te) if valid_te.sum() > 0 else None
+        else:
+            pred = None
 
     if pred is not None and valid_te.sum() > 0:
-        test_mape = mape(y_te[valid_te], pred[valid_te])
-        results["test_mape"] = test_mape
-        logger.info("Test MAPE (%s): %.2f%%", best_name, test_mape)
+        pred_orig = np.expm1(pred) if use_log else pred
+        from training.metrics import compute_all_metrics
+        lag1_col = "price_per_kg_mean_lag1"
+        y_naive = None
+        if lag1_col in test_df.columns:
+            nv = test_df[lag1_col].values[valid_te]
+            if np.isfinite(nv).all():
+                y_naive = nv
+        metrics = compute_all_metrics(y_te[valid_te], pred_orig[valid_te], y_naive=y_naive)
+        results["test_metrics"] = metrics
+        results["test_mape"] = metrics["mape"]
+        for k, v in metrics.items():
+            logger.info("Test %s: %.4f", k, v)
 
         # Per-season MAPE
         test_df = test_df.copy()
-        test_df["_pred"] = pred
+        test_df["_pred"] = pred_orig
         test_df["_month"] = pd.to_datetime(test_df["date"].astype(str), format="%Y%m%d").dt.month
         test_df["_season"] = test_df["_month"].apply(_month_to_season)
         season_mape = {}
@@ -479,6 +630,19 @@ def run_pipeline(
     lines = [
         "# Training Pipeline Report",
         "",
+        "## 예측 품종",
+        f"**{results.get('variety', '-')}** (최다 품종만 학습/예측)",
+        "",
+        "### 품종별 샘플 수 (학습에 사용된 품종)",
+        "| 품종 | 샘플 수 |",
+        "|------|---------|",
+    ]
+    for v, c in results.get("variety_counts", {}).items():
+        lines.append(f"| {v} | {c} |")
+    if not results.get("variety_counts"):
+        lines.append("| (전체 품종) | - |")
+    lines.extend([
+        "",
         "## Baseline",
         "| Model | MAPE (%) |",
         "|-------|----------|",
@@ -495,8 +659,19 @@ def run_pipeline(
         lines.append(f"| {k} | {v['mean']:.2f} | {v['std']:.2f} | {v['worst']:.2f} |")
     lines.extend([
         "",
+        f"## CV 방법: {config.get('cv', {}).get('method', 'expanding')}",
+        "",
         f"## Best Model: {best_name}",
-        f"Test MAPE: {results['test_mape']:.2f}%" if isinstance(results.get('test_mape'), (int, float)) else "Test MAPE: -",
+        "",
+        "## Test Metrics",
+        "| Metric | Value |",
+        "|--------|-------|",
+    ])
+    for k, v in results.get("test_metrics", {}).items():
+        lines.append(f"| {k} | {v:.4f} |")
+    if "test_metrics" not in results and isinstance(results.get("test_mape"), (int, float)):
+        lines.append(f"| mape | {results['test_mape']:.4f} |")
+    lines.extend([
         "",
         "## Season MAPE",
         "| Season | MAPE (%) |",
@@ -517,6 +692,9 @@ def main():
     parser.add_argument("--seed", type=int, default=None, help="Split 고정용 seed (기본: config)")
     parser.add_argument("--skip-feature-refine", action="store_true")
     parser.add_argument("--skip-shap", action="store_true", help="SHAP feature refinement 스킵 (기본)")
+    parser.add_argument("--model", type=str, nargs="+", default=None, help="실행할 모델만 (lgb, catboost, elasticnet, lstm, transformer)")
+    parser.add_argument("--cv", type=str, default=None, help="CV 방법: expanding, timeseries, purged")
+    parser.add_argument("--no-deep", action="store_true", help="LSTM/Transformer 스킵")
     args = parser.parse_args()
 
     run_pipeline(
@@ -525,6 +703,9 @@ def main():
         seed=args.seed,
         skip_feature_refine=args.skip_feature_refine,
         skip_shap=args.skip_shap,
+        models=args.model,
+        cv_method=args.cv,
+        no_deep=args.no_deep,
     )
 
 
