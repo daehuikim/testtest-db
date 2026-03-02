@@ -1,0 +1,43 @@
+{
+  "use_gpu": true,
+  "variety_filter": {
+    "min_pct": 2.0,
+    "whitelist": null,
+    "max_varieties": null
+  },
+  "lag_depths": {
+    "target_price": 60,
+    "domae_somae": 30,
+    "weather": 21
+  },
+  "rolling_windows": [7, 14, 30],
+  "stage1_prefilter": {
+    "ccf_threshold": 0.15,
+    "mi_percentile": 75
+  },
+  "stage2_elasticnet": {
+    "cv_splits": 5,
+    "max_iter": 50000,
+    "tol": 0.001,
+    "alphas": [0.1, 1.0, 10.0, 100.0],
+    "l1_ratios": [0.1, 0.5, 0.9],
+    "use_lightgbm_fallback": true
+  },
+  "stage3_rolling_permutation": {
+    "n_windows": 5,
+    "min_window_size": 60,
+    "stability_lambda": 0.3,
+    "top_percentile": 50,
+    "min_kept": 50
+  },
+  "stage4_stability": {
+    "min_jaccard": 0.5,
+    "min_rank_corr": 0.3,
+    "min_kept": 30
+  },
+  "stage5_common": {
+    "min_variety_ratio": 0.5,
+    "top_k_per_variety": 80,
+    "min_kept": 20
+  }
+}
