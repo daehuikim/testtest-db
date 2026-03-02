@@ -42,7 +42,8 @@ feature_refine:
 
 # Target 전처리
 target:
-  use_log: true          # log1p(price) 학습 → expm1 복원 후 MAPE
+  loss: "mape"           # mape | mse (mape: raw target + MAPE loss, mse: log target + MSE)
+  use_log: true          # mse일 때만 사용 (mape면 raw)
   outlier_clip_pct: 1.0  # 상/하위 1% clip (spike 제거)
 
 # Baseline
@@ -94,7 +95,7 @@ lstm:
   dropout: 0.3
 
 transformer:
-  enabled: true
+  enabled: false         # MAPE 40%+ 수준으로 비활성화
   seq_len: 365
   d_model: 32
   nhead: 4

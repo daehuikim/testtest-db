@@ -87,7 +87,7 @@ def preprocess_target(
     return train_df, test_df
 
 
-def _lgb_params(config: dict, use_gpu: bool) -> dict:
+def _lgb_params(config: dict, use_gpu: bool, use_mape_loss: bool = False) -> dict:
     cfg = config.get("lgb", {})
     p = dict(
         n_estimators=cfg.get("n_estimators", 500),
@@ -96,12 +96,14 @@ def _lgb_params(config: dict, use_gpu: bool) -> dict:
         verbosity=-1,
         random_state=RANDOM_STATE,
     )
+    if use_mape_loss:
+        p["objective"] = "mape"
     if use_gpu:
         p["device"] = "gpu"
     return p
 
 
-def _cb_params(config: dict, use_gpu: bool) -> dict:
+def _cb_params(config: dict, use_gpu: bool, use_mape_loss: bool = False) -> dict:
     cfg = config.get("catboost", {})
     p = dict(
         iterations=cfg.get("iterations", 500),
@@ -109,6 +111,8 @@ def _cb_params(config: dict, use_gpu: bool) -> dict:
         verbose=0,
         random_seed=RANDOM_STATE,
     )
+    if use_mape_loss:
+        p["loss_function"] = "MAPE"
     if use_gpu:
         p["task_type"] = "GPU"
     return p
@@ -254,6 +258,7 @@ def expanding_cv_mape(
     model_name: str,
     config: dict,
     use_log: bool = False,
+    use_mape_loss: bool = False,
     cv_method: Optional[str] = None,
 ) -> tuple:
     """CV로 MAPE 평균, std, worst fold 반환. OOF 예측도 반환 (stacking용)."""
@@ -292,17 +297,17 @@ def expanding_cv_mape(
             if model_name == "lgb":
                 import lightgbm as lgb
                 from feature_selection.device_utils import fit_lgb_with_fallback
-                m = lgb.LGBMRegressor(**_lgb_params(config, use_gpu))
+                m = lgb.LGBMRegressor(**_lgb_params(config, use_gpu, use_mape_loss))
                 m = fit_lgb_with_fallback(m, X_tr, y_tr, "gpu" if use_gpu else "cpu")
             elif model_name == "catboost":
                 import catboost as cb
                 try:
-                    m = cb.CatBoostRegressor(**_cb_params(config, use_gpu))
+                    m = cb.CatBoostRegressor(**_cb_params(config, use_gpu, use_mape_loss))
                     m.fit(X_tr, y_tr)
                 except Exception as e:
                     if use_gpu and ("gpu" in str(e).lower() or "cuda" in str(e).lower() or "device" in str(e).lower()):
                         logger.warning("CatBoost GPU 실패, CPU fallback: %s", str(e)[:40])
-                        m = cb.CatBoostRegressor(**_cb_params(config, False))
+                        m = cb.CatBoostRegressor(**_cb_params(config, False, use_mape_loss))
                         m.fit(X_tr, y_tr)
                     else:
                         raise
@@ -321,7 +326,7 @@ def expanding_cv_mape(
                 m = LSTMWrapper(
                     seq_len=len(seq_cols), hidden=cfg.get("hidden", 64), layers=cfg.get("layers", 2),
                     epochs=cfg.get("epochs", 100), patience=cfg.get("patience", 10),
-                    dropout=cfg.get("dropout", 0.2),
+                    dropout=cfg.get("dropout", 0.2), use_mape_loss=use_mape_loss,
                 )
                 m.fit(X_seq_tr, y_tr, X_val=X_seq_val, y_val=y_train[valid_idx])
                 pred_val = m.predict(X_seq_val)
@@ -354,6 +359,76 @@ def expanding_cv_mape(
     if not fold_mapes:
         return float("inf"), float("inf"), float("inf"), oof_pred
     return np.mean(fold_mapes), np.std(fold_mapes), max(fold_mapes), oof_pred
+
+
+def _seasonal_routing_cv(
+    train_df: pd.DataFrame,
+    features: list,
+    config: dict,
+    use_log: bool,
+    use_mape_loss: bool,
+    use_gpu: bool,
+    cv_method: Optional[str] = None,
+) -> tuple:
+    """계절별 LGBM 모델, 월 기준 라우팅. (OOF MAPE, oof_pred) 반환."""
+    from training.cv_splits import get_cv_folds
+
+    data = train_df.sort_values("date").reset_index(drop=True)
+    data = data[data[TARGET_COL].notna()].copy()
+    data = data.fillna(data[features].median())
+    data["_month"] = pd.to_datetime(data["date"].astype(str), format="%Y%m%d").dt.month
+    data["_season"] = data["_month"].apply(_month_to_season)
+    X = data[features]
+    y = data[Y_TARGET_COL].values if Y_TARGET_COL in data.columns else data[TARGET_COL].values
+    y_orig = data[TARGET_COL].values
+    oof_pred = np.full(len(data), np.nan)
+    fold_mapes = []
+    cv_cfg = config.get("cv", {})
+    _cv_method = cv_method or cv_cfg.get("method", "expanding")
+    config["cv"] = {**cv_cfg, "method": _cv_method}
+
+    fold_gen = get_cv_folds(
+        data,
+        method=config["cv"].get("method", "expanding"),
+        n_folds=cv_cfg.get("n_folds", 5),
+        n_splits=cv_cfg.get("n_folds", 5),
+        valid_days=cv_cfg.get("valid_days", 30),
+        purge_days=cv_cfg.get("purge_days", 7),
+        embargo_days=cv_cfg.get("embargo_days", 3),
+    )
+
+    for train_idx, valid_idx in fold_gen:
+        try:
+            import lightgbm as lgb
+            from feature_selection.device_utils import fit_lgb_with_fallback
+            models_by_season = {}
+            for s in SEASON_MONTHS:
+                mask = (data.iloc[train_idx]["_season"] == s).values
+                if mask.sum() < 30:
+                    continue
+                tr_idx = np.array(train_idx)[mask]
+                m = lgb.LGBMRegressor(**_lgb_params(config, use_gpu, use_mape_loss))
+                m = fit_lgb_with_fallback(m, X.iloc[tr_idx], y[tr_idx], "gpu" if use_gpu else "cpu")
+                models_by_season[s] = m
+            if len(models_by_season) < 2:
+                continue
+            for i in valid_idx:
+                s = data.iloc[i]["_season"]
+                if s in models_by_season:
+                    oof_pred[i] = models_by_season[s].predict(X.iloc[[i]])[0]
+                elif models_by_season:
+                    fallback_s = list(models_by_season)[0]
+                    oof_pred[i] = models_by_season[fallback_s].predict(X.iloc[[i]])[0]
+            pred_orig = np.expm1(oof_pred[valid_idx]) if use_log else oof_pred[valid_idx]
+            valid_mask = np.isfinite(pred_orig) & np.isfinite(y_orig[valid_idx])
+            if valid_mask.sum() > 5:
+                fold_mapes.append(mape(y_orig[valid_idx][valid_mask], pred_orig[valid_mask]))
+        except Exception as e:
+            logger.warning("Seasonal routing fold 실패: %s", str(e)[:40])
+
+    if not fold_mapes:
+        return float("inf"), oof_pred
+    return np.mean(fold_mapes), oof_pred
 
 
 def run_pipeline(
@@ -435,15 +510,18 @@ def run_pipeline(
         seed=split_seed,
     )
 
-    # Target 전처리: outlier clip + log
+    # Target 전처리: outlier clip + log (MSE) or raw (MAPE)
     target_cfg = config.get("target", {})
-    use_log = target_cfg.get("use_log", True)
+    use_mape_loss = (target_cfg.get("loss", "mse") or "mse").lower() == "mape"
+    use_log = not use_mape_loss and target_cfg.get("use_log", True)
     clip_pct = target_cfg.get("outlier_clip_pct", 1.0)
     train_df, test_df = preprocess_target(
         train_df, test_df, TARGET_COL,
         clip_pct=clip_pct, use_log=use_log,
     )
-    if use_log:
+    if use_mape_loss:
+        logger.info("Target: raw price, MAPE loss")
+    elif use_log:
         logger.info("Target: log1p(price) 학습, expm1 복원 후 평가")
     if clip_pct > 0:
         logger.info("Outlier clip: 상/하위 %.1f%%", clip_pct)
@@ -508,7 +586,7 @@ def run_pipeline(
     for name in model_list:
         try:
             mean_mape, std_mape, worst_mape, oof = expanding_cv_mape(
-                train_df, features, name, config, use_log=use_log, cv_method=cv_method,
+                train_df, features, name, config, use_log=use_log, use_mape_loss=use_mape_loss, cv_method=cv_method,
             )
             model_scores[name] = {"mean": mean_mape, "std": std_mape, "worst": worst_mape}
             if oof is not None and np.isfinite(oof).sum() > 10:
@@ -564,13 +642,30 @@ def run_pipeline(
     if use_stacking:
         logger.info("최적 앙상블: %s (OOF MAPE %.2f%%)", best_combo_name, best_combo_mape)
 
+    # Seasonal routing: 계절별 모델 → 월 기준 라우팅
+    seasonal_oof_mape = float("inf")
+    try:
+        seasonal_oof_mape, _ = _seasonal_routing_cv(
+            train_df, features, config, use_log, use_mape_loss, use_gpu, cv_method,
+        )
+        if seasonal_oof_mape < 1e9:
+            logger.info("Seasonal routing OOF MAPE: %.2f%%", seasonal_oof_mape)
+    except Exception as e:
+        logger.warning("Seasonal routing CV 실패: %s", str(e)[:60])
+
     # 단일 모델 best (앙상블보다 나쁠 수 있음)
     best_single = min(
         (k for k, v in model_scores.items() if v["mean"] < 1e9),
         key=lambda k: (model_scores[k]["mean"], model_scores[k]["std"]),
         default="lgb",
     )
-    best_name = best_combo_name if (use_stacking and best_combo_mape < model_scores.get(best_single, {}).get("mean", 1e9)) else best_single
+    candidates = [
+        (best_combo_mape, best_combo_name if use_stacking else None),
+        (seasonal_oof_mape, "seasonal_routing"),
+        (model_scores.get(best_single, {}).get("mean", 1e9), best_single),
+    ]
+    best_mape, best_name = min((m, n) for m, n in candidates if n is not None and m < 1e9)
+    use_seasonal_routing = best_name == "seasonal_routing"
 
     # Final train on full train set
     train_full = train_df[train_df[TARGET_COL].notna()].fillna(train_df.median(numeric_only=True))
@@ -586,8 +681,48 @@ def run_pipeline(
     base_models_for_checkpoint: List[Any] = []
     meta_for_checkpoint = None
     seq_cols_for_checkpoint: Optional[List[str]] = None
+    seasonal_models_for_checkpoint: Optional[dict] = None
 
-    if use_stacking and best_combo and len(best_combo) >= 2:
+    if use_seasonal_routing:
+        # 계절별 모델 학습 → test 시 월 기준 라우팅
+        train_full["_month"] = pd.to_datetime(train_full["date"].astype(str), format="%Y%m%d").dt.month
+        train_full["_season"] = train_full["_month"].apply(_month_to_season)
+        test_df = test_df.copy()
+        test_df["_month"] = pd.to_datetime(test_df["date"].astype(str), format="%Y%m%d").dt.month
+        test_df["_season"] = test_df["_month"].apply(_month_to_season)
+        try:
+            import lightgbm as lgb
+            from feature_selection.device_utils import fit_lgb_with_fallback
+            seasonal_models = {}
+            for s in SEASON_MONTHS:
+                sub = train_full[train_full["_season"] == s]
+                if len(sub) < 30:
+                    continue
+                m = lgb.LGBMRegressor(**_lgb_params(config, use_gpu, use_mape_loss))
+                m = fit_lgb_with_fallback(m, sub[features], sub[Y_TARGET_COL] if Y_TARGET_COL in sub.columns else sub[TARGET_COL], "gpu" if use_gpu else "cpu")
+                seasonal_models[s] = m
+            if seasonal_models:
+                pred_list = []
+                fallback_s = list(seasonal_models)[0]
+                for idx in range(len(test_df)):
+                    row = test_df.iloc[idx]
+                    s = row["_season"]
+                    m = seasonal_models.get(s, seasonal_models[fallback_s])
+                    pred_list.append(m.predict(X_te.iloc[[idx]])[0])
+                pred = np.array(pred_list)
+                seasonal_models_for_checkpoint = seasonal_models
+                logger.info("Seasonal routing 적용 (%d 계절)", len(seasonal_models))
+            else:
+                pred = None
+                use_seasonal_routing = False
+                best_name = best_single
+        except Exception as e:
+            logger.warning("Seasonal routing 실패: %s", str(e)[:60])
+            pred = None
+            use_seasonal_routing = False
+            best_name = best_single
+
+    if not use_seasonal_routing and use_stacking and best_combo and len(best_combo) >= 2:
         # Stacking: best_combo 모델들 → Ridge meta
         import lightgbm as lgb
         import catboost as cb
@@ -597,18 +732,18 @@ def run_pipeline(
         preds_tr, preds_te = [], []
         for mname in best_combo:
             if mname == "lgb":
-                m = lgb.LGBMRegressor(**_lgb_params(config, use_gpu))
+                m = lgb.LGBMRegressor(**_lgb_params(config, use_gpu, use_mape_loss))
                 m = fit_lgb_with_fallback(m, X_tr, y_tr, "gpu" if use_gpu else "cpu")
                 base_models_for_checkpoint.append(m)
                 preds_tr.append(m.predict(X_tr))
                 preds_te.append(m.predict(X_te))
             elif mname == "catboost":
                 try:
-                    m = cb.CatBoostRegressor(**_cb_params(config, use_gpu))
+                    m = cb.CatBoostRegressor(**_cb_params(config, use_gpu, use_mape_loss))
                     m.fit(X_tr, y_tr)
                 except Exception as e:
                     if use_gpu and ("gpu" in str(e).lower() or "cuda" in str(e).lower() or "device" in str(e).lower()):
-                        m = cb.CatBoostRegressor(**_cb_params(config, False))
+                        m = cb.CatBoostRegressor(**_cb_params(config, False, use_mape_loss))
                         m.fit(X_tr, y_tr)
                     else:
                         raise
@@ -629,7 +764,7 @@ def run_pipeline(
                     cfg = config.get("lstm", {})
                     X_seq_tr = build_sequence_array(train_full, seq_cols)
                     X_seq_te = build_sequence_array(test_df, seq_cols)
-                    m = LSTMWrapper(seq_len=len(seq_cols), hidden=cfg.get("hidden", 64), layers=cfg.get("layers", 2), epochs=cfg.get("epochs", 100), patience=cfg.get("patience", 10), dropout=cfg.get("dropout", 0.2))
+                    m = LSTMWrapper(seq_len=len(seq_cols), hidden=cfg.get("hidden", 64), layers=cfg.get("layers", 2), epochs=cfg.get("epochs", 100), patience=cfg.get("patience", 10), dropout=cfg.get("dropout", 0.2), use_mape_loss=use_mape_loss)
                     m.fit(X_seq_tr, y_tr.values)
                     base_models_for_checkpoint.append(m)
                     seq_cols_for_checkpoint = seq_cols
@@ -679,19 +814,19 @@ def run_pipeline(
         if best_name == "lgb":
             import lightgbm as lgb
             from feature_selection.device_utils import fit_lgb_with_fallback
-            final_model = lgb.LGBMRegressor(**_lgb_params(config, use_gpu))
+            final_model = lgb.LGBMRegressor(**_lgb_params(config, use_gpu, use_mape_loss))
             final_model = fit_lgb_with_fallback(final_model, X_tr, y_tr, "gpu" if use_gpu else "cpu")
             base_models_for_checkpoint.append(final_model)
             pred = final_model.predict(X_te) if valid_te.sum() > 0 else None
         elif best_name == "catboost":
             import catboost as cb
             try:
-                final_model = cb.CatBoostRegressor(**_cb_params(config, use_gpu))
+                final_model = cb.CatBoostRegressor(**_cb_params(config, use_gpu, use_mape_loss))
                 final_model.fit(X_tr, y_tr)
             except Exception as e:
                 if use_gpu and ("gpu" in str(e).lower() or "cuda" in str(e).lower() or "device" in str(e).lower()):
                     logger.warning("CatBoost GPU 실패, CPU fallback")
-                    final_model = cb.CatBoostRegressor(**_cb_params(config, False))
+                    final_model = cb.CatBoostRegressor(**_cb_params(config, False, use_mape_loss))
                     final_model.fit(X_tr, y_tr)
                 else:
                     raise
@@ -715,10 +850,10 @@ def run_pipeline(
                     split = int(n * 0.8)
                     X_tr_sub, X_val_sub = X_seq_tr[:split], X_seq_tr[split:]
                     y_tr_sub, y_val_sub = y_tr.values[:split], y_tr.values[split:]
-                    final_model = LSTMWrapper(seq_len=len(seq_cols), hidden=cfg.get("hidden", 64), layers=cfg.get("layers", 2), epochs=cfg.get("epochs", 100), patience=cfg.get("patience", 10), dropout=cfg.get("dropout", 0.2))
+                    final_model = LSTMWrapper(seq_len=len(seq_cols), hidden=cfg.get("hidden", 64), layers=cfg.get("layers", 2), epochs=cfg.get("epochs", 100), patience=cfg.get("patience", 10), dropout=cfg.get("dropout", 0.2), use_mape_loss=use_mape_loss)
                     final_model.fit(X_tr_sub, y_tr_sub, X_val=X_val_sub, y_val=y_val_sub)
                 else:
-                    final_model = LSTMWrapper(seq_len=len(seq_cols), hidden=cfg.get("hidden", 64), layers=cfg.get("layers", 2), epochs=cfg.get("epochs", 100), dropout=cfg.get("dropout", 0.2))
+                    final_model = LSTMWrapper(seq_len=len(seq_cols), hidden=cfg.get("hidden", 64), layers=cfg.get("layers", 2), epochs=cfg.get("epochs", 100), dropout=cfg.get("dropout", 0.2), use_mape_loss=use_mape_loss)
                     final_model.fit(X_seq_tr, y_tr.values)
                 base_models_for_checkpoint.append(final_model)
                 seq_cols_for_checkpoint = seq_cols
@@ -815,11 +950,12 @@ def run_pipeline(
 
     results["best_model"] = best_name
     results["use_stacking"] = use_stacking
+    results["use_seasonal_routing"] = use_seasonal_routing
     results["n_features"] = len(features)
     results["test_dates"] = len(test_dates)
 
     # Save best model checkpoint for serving/inference
-    if pred is not None and (base_models_for_checkpoint or meta_for_checkpoint):
+    if pred is not None and (base_models_for_checkpoint or meta_for_checkpoint or seasonal_models_for_checkpoint):
         try:
             import joblib
             CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
@@ -836,10 +972,12 @@ def run_pipeline(
                     pass
             ckpt = {
                 "use_stacking": use_stacking,
+                "use_seasonal_routing": use_seasonal_routing,
                 "best_name": best_name,
                 "meta": meta_for_checkpoint,
                 "base_models": base_models_for_checkpoint,
                 "base_names": base_names,
+                "seasonal_models": seasonal_models_for_checkpoint,
                 "features": features,
                 "use_log": use_log,
                 "seq_cols": seq_cols_for_checkpoint,
@@ -848,7 +986,9 @@ def run_pipeline(
                 "variety_filter": rep_varieties,
             }
             ckpt_path = CHECKPOINT_DIR / "checkpoint.joblib"
-            joblib.dump(ckpt, ckpt_path)
+            tmp_path = ckpt_path.with_suffix(".joblib.tmp")
+            joblib.dump(ckpt, tmp_path)
+            tmp_path.replace(ckpt_path)  # atomic on same filesystem
             logger.info("Best model checkpoint saved: %s", ckpt_path)
         except Exception as e:
             logger.warning("Checkpoint save failed: %s", str(e)[:80])

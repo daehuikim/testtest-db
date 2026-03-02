@@ -63,6 +63,7 @@ class LSTMWrapper:
         lr: float = 0.001,
         patience: int = 10,
         dropout: float = 0.2,
+        use_mape_loss: bool = False,
         checkpoint_dir: Optional[Path] = None,
     ):
         self.seq_len = seq_len
@@ -72,6 +73,7 @@ class LSTMWrapper:
         self.lr = lr
         self.patience = patience
         self.dropout = dropout
+        self.use_mape_loss = use_mape_loss
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else CHECKPOINT_DIR
         self.model = None
         self.seq_cols = None
@@ -120,7 +122,11 @@ class LSTMWrapper:
             self.model.train()
             opt.zero_grad()
             pred = self.model(X_t)
-            loss = nn.MSELoss()(pred, y_t)
+            if self.use_mape_loss:
+                eps = 1e-8
+                loss = torch.mean(torch.abs((y_t - pred) / (torch.abs(y_t) + eps)))
+            else:
+                loss = nn.MSELoss()(pred, y_t)
             loss.backward()
             opt.step()
             train_loss = loss.item()

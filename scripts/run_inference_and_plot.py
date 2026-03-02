@@ -33,7 +33,18 @@ CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "best_model"
 def load_checkpoint(ckpt_path: Path) -> dict:
     """Load model checkpoint."""
     import joblib
-    ckpt = joblib.load(ckpt_path)
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+    size = ckpt_path.stat().st_size
+    if size < 100:
+        raise ValueError(f"Checkpoint file too small ({size} bytes), likely corrupted. Re-run training.")
+    try:
+        ckpt = joblib.load(ckpt_path)
+    except (EOFError, ValueError) as e:
+        raise ValueError(
+            f"Checkpoint corrupted or incomplete (EOFError). "
+            f"Delete {ckpt_path} and re-run: python scripts/run_training_pipeline.py --skip-shap"
+        ) from e
     return ckpt
 
 
@@ -46,13 +57,25 @@ def load_data(data_path: Path, variety_filter: list) -> pd.DataFrame:
     return df
 
 
+SEASON_MONTHS = {"spring": [3, 4, 5], "summer": [6, 7, 8], "fall": [9, 10, 11], "winter": [12, 1, 2]}
+
+
+def _month_to_season(month: int) -> str:
+    for name, months in SEASON_MONTHS.items():
+        if month in months:
+            return name
+    return "unknown"
+
+
 def predict_batch(ckpt: dict, df: pd.DataFrame, dates: list) -> tuple:
     """Run inference for given dates. Returns (predictions array, ordered dates)."""
     features = ckpt["features"]
     use_log = ckpt["use_log"]
     use_stacking = ckpt["use_stacking"]
-    base_models = ckpt["base_models"]
-    base_names = ckpt["base_names"]
+    use_seasonal_routing = ckpt.get("use_seasonal_routing", False)
+    seasonal_models = ckpt.get("seasonal_models")
+    base_models = ckpt.get("base_models", [])
+    base_names = ckpt.get("base_names", [])
     meta = ckpt.get("meta")
     seq_cols = ckpt.get("seq_cols")
 
@@ -65,25 +88,36 @@ def predict_batch(ckpt: dict, df: pd.DataFrame, dates: list) -> tuple:
     med = sub.median(numeric_only=True)
     sub = sub.fillna(med)
 
-    preds_list = []
-    for i, name in enumerate(base_names):
-        m = base_models[i]
-        if name in ("lstm", "transformer") and seq_cols:
-            from training.deep_models import build_sequence_array
-            X_seq = build_sequence_array(sub, seq_cols)
-            p = m.predict(X_seq)
-        else:
-            X = sub[features]
-            p = m.predict(X)
-        preds_list.append(p)
-
-    if use_stacking and meta is not None and len(preds_list) >= 2:
-        oof = np.column_stack(preds_list)
-        valid = np.all(np.isfinite(oof), axis=1)
-        pred = np.full(len(oof), np.nan)
-        pred[valid] = meta.predict(oof[valid])
+    if use_seasonal_routing and seasonal_models:
+        sub["_month"] = pd.to_datetime(sub["date"].astype(str), format="%Y%m%d").dt.month
+        sub["_season"] = sub["_month"].apply(_month_to_season)
+        pred_list = []
+        fallback_s = list(seasonal_models)[0]
+        for idx in range(len(sub)):
+            s = sub.iloc[idx]["_season"]
+            m = seasonal_models.get(s, seasonal_models[fallback_s])
+            pred_list.append(m.predict(sub[features].iloc[[idx]])[0])
+        pred = np.array(pred_list)
     else:
-        pred = preds_list[0]
+        preds_list = []
+        for i, name in enumerate(base_names):
+            m = base_models[i]
+            if name in ("lstm", "transformer") and seq_cols:
+                from training.deep_models import build_sequence_array
+                X_seq = build_sequence_array(sub, seq_cols)
+                p = m.predict(X_seq)
+            else:
+                X = sub[features]
+                p = m.predict(X)
+            preds_list.append(p)
+
+        if use_stacking and meta is not None and len(preds_list) >= 2:
+            oof = np.column_stack(preds_list)
+            valid = np.all(np.isfinite(oof), axis=1)
+            pred = np.full(len(oof), np.nan)
+            pred[valid] = meta.predict(oof[valid])
+        else:
+            pred = preds_list[0] if preds_list else np.array([])
 
     if use_log:
         pred = np.expm1(pred)
