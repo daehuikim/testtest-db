@@ -1,0 +1,64 @@
+# Training Pipeline Config
+# 스크립트 최소화: run_training_pipeline.py 단일 진입점
+
+use_gpu: true  # LGBM, CatBoost GPU 가속
+
+# Lag feature clustering (base별 대표 lag 1개)
+feature_cluster:
+  enabled: true
+  top_k_per_base: 1   # base당 상위 1개 lag만 유지
+
+# 데이터 분할
+# Train: 전체 데이터에서 test ~70일만 제외한 나머지 전부
+# Test: 전체 unique date에서 계절 균형 랜덤 ~70일
+# seed 고정 시 split 고정 → 모델 비교 시 동일 split 사용
+split:
+  test_days: 70                    # 계절 균형 랜덤 선정 (봄/여름/가을/겨울 포함)
+  test_ratio: 0.1                 # test_days=0이면 unique date의 10%
+  seed: 42                         # split 고정 (바꾸면 다른 split)
+
+# Expanding Walk-forward CV (Train 내부)
+cv:
+  valid_days: 30
+  n_folds: 5
+  # Fold 예: (train_end, valid) = (2024-09, 2024-10), (2024-10, 2024-11), ...
+
+# Feature 재정제 (SHAP)
+feature_refine:
+  top_n_by_mean: 60
+  min_rank_corr: 0.4
+  max_final: 60
+  min_final: 40
+
+# Baseline
+baseline:
+  naive_lag: 1
+  seasonal_lag: 7
+
+# LightGBM (Primary)
+lgb:
+  n_estimators: 500
+  num_leaves: [15, 31, 63]
+  max_depth: [3, 5, 6, 8]
+  min_data_in_leaf: [20, 40, 80]
+  feature_fraction: [0.6, 0.8, 0.9]
+  bagging_fraction: [0.6, 0.8, 0.9]
+  lambda_l1: [0, 1, 10]
+  lambda_l2: [0, 1, 10]
+  n_trials: 50                     # Optuna trials (또는 grid 샘플)
+
+# CatBoost (Secondary)
+catboost:
+  iterations: 500
+  depth: [4, 6, 8]
+  n_trials: 20
+
+# ElasticNet
+elasticnet:
+  alphas: [0.01, 0.1, 1.0, 10.0]
+  l1_ratios: [0.1, 0.5, 0.9]
+
+# Stacking
+stacking:
+  oof_corr_threshold: 0.95         # LGBM vs CatBoost OOF corr < 이면 stacking
+  meta_model: "ridge"

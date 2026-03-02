@@ -122,7 +122,26 @@ def run_pipeline(
     logger.info("=" * 60)
     logger.info("Stage 5: Common feature across varieties")
     s5 = stage5_common(df, features, config=config)
-    final_features = sorted(s5) if s5 else features
+    features = list(s5) if s5 else features
+
+    # Stage 6: Lag clustering (base별 대표 lag 1개)
+    s5_count = len(features)
+    cluster_cfg = config.get("feature_cluster", {})
+    if cluster_cfg.get("enabled", True) and len(features) > 30:
+        try:
+            sys.path.insert(0, str(SCRIPT_DIR))
+            from training.feature_cluster import reduce_by_lag_representative
+            features = reduce_by_lag_representative(
+                df, features,
+                target_col="price_per_kg_mean",
+                top_k_per_base=cluster_cfg.get("top_k_per_base", 1),
+                use_gpu=config.get("use_gpu", False),
+                random_state=42,
+            )
+            logger.info("Stage 6: Lag clustering 완료")
+        except Exception as e:
+            logger.warning("Stage 6 (Lag clustering) 스킵: %s", str(e)[:50])
+    final_features = sorted(features)
 
     # 리포트 저장
     report = {
@@ -133,6 +152,8 @@ def run_pipeline(
         "stage2_kept": len(s2) if s2 else 0,
         "stage3_kept": len(s3) if s3 else 0,
         "stage4_kept": len(s4) if s4 else 0,
+        "stage5_kept": s5_count,
+        "stage6_kept": len(final_features),
         "final_features": final_features,
         "n_final": len(final_features),
     }
@@ -156,7 +177,8 @@ def run_pipeline(
         f"| 2 (Elastic Net) | {len(s2) if s2 else '-'} |",
         f"| 3 (Rolling Perm) | {len(s3) if s3 else '-'} |",
         f"| 4 (Stability) | {len(s4) if s4 else '-'} |",
-        f"| 5 (Common) | {len(final_features)} |",
+        f"| 5 (Common) | {s5_count} |",
+        f"| 6 (Lag cluster) | {len(final_features)} |",
         "",
         "## 최종 Feature Set",
         "",

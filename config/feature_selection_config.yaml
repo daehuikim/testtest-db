@@ -47,3 +47,8 @@ stage5_common:
   min_variety_ratio: 0.5   # 완화 (0.7→0.5)
   top_k_per_variety: 80    # 상위 80개 고려
   min_kept: 20             # 최소 20개 유지
+
+# Stage 6: Lag clustering (base별 대표 lag 1개)
+feature_cluster:
+  enabled: true
+  top_k_per_base: 1

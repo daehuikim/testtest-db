@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+"""
+학습 파이프라인 (단일 진입점)
+
+1. 데이터 분할: Train 고정 + Test 계절 균형 랜덤
+2. Expanding Walk-forward CV
+3. Baseline (naive, 7-day seasonal)
+4. Feature 재정제 (SHAP → 40~60개)
+5. 모델 비교 (LGBM / CatBoost / ElasticNet)
+6. Stacking 여부 판단 (OOF corr < 0.95)
+7. 최종 학습 + Test 평가 (계절별 MAPE)
+"""
+
+import argparse
+import json
+import logging
+import sys
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+sys.path.insert(0, str(SCRIPT_DIR))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+TARGET_COL = "price_per_kg_mean"
+RANDOM_STATE = 42
+
+# Season for MAPE breakdown
+SEASON_MONTHS = {"spring": [3, 4, 5], "summer": [6, 7, 8], "fall": [9, 10, 11], "winter": [12, 1, 2]}
+
+
+def _month_to_season(month: int) -> str:
+    for name, months in SEASON_MONTHS.items():
+        if month in months:
+            return name
+    return "unknown"
+
+
+def mape(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-8) -> float:
+    return np.mean(np.abs((y_true - y_pred) / (np.abs(y_true) + eps))) * 100
+
+
+def _lgb_params(config: dict, use_gpu: bool) -> dict:
+    cfg = config.get("lgb", {})
+    p = dict(
+        n_estimators=cfg.get("n_estimators", 500),
+        max_depth=6,
+        num_leaves=31,
+        verbosity=-1,
+        random_state=RANDOM_STATE,
+    )
+    if use_gpu:
+        p["device"] = "gpu"
+    return p
+
+
+def _cb_params(config: dict, use_gpu: bool) -> dict:
+    cfg = config.get("catboost", {})
+    p = dict(
+        iterations=cfg.get("iterations", 500),
+        depth=6,
+        verbose=0,
+        random_seed=RANDOM_STATE,
+    )
+    if use_gpu:
+        p["task_type"] = "GPU"
+    return p
+
+
+def load_data_and_features(
+    data_path: Path = None,
+    report_path: Path = None,
+) -> tuple:
+    """merged CSV + feature_selection report 로드."""
+    data_path = data_path or PROJECT_ROOT / "temp" / "merged_stage0.csv"
+    report_path = report_path or PROJECT_ROOT / "reports" / "feature_selection_pipeline_report.json"
+
+    if not data_path.exists():
+        logger.info("merged_stage0 없음 → Feature selection pipeline 실행 후 temp/merged_stage0.csv 생성")
+        from feature_selection.config_loader import load_config
+        from feature_selection.data_merger import DataMerger
+        from feature_selection.stage5_common import get_variety_list
+
+        config = load_config()
+        merger = DataMerger(data_root=PROJECT_ROOT / "data" / "raw", config=config)
+        df = merger.run()
+        variety_cfg = config.get("variety_filter", {})
+        if variety_cfg.get("min_pct"):
+            cnt = df["품종"].value_counts()
+            pct = cnt / len(df) * 100
+            keep = pct[pct >= variety_cfg["min_pct"]].index.tolist()
+            df = df[df["품종"].isin(keep)].copy()
+    else:
+        df = pd.read_csv(data_path, encoding="utf-8-sig")
+
+    df["date"] = df["date"].astype(str).str.replace(r"\D", "", regex=True).str[:8].str.zfill(8)
+
+    features = []
+    if report_path.exists():
+        with open(report_path, encoding="utf-8") as f:
+            report = json.load(f)
+        features = report.get("final_features", [])
+    # report에 feature가 너무 적으면 (<20) 데이터에서 전체 numeric 사용
+    if not features or len(features) < 20:
+        exclude = {"date", "품종", TARGET_COL, "price_per_kg_median", "price_per_kg_std"}
+        fallback = [c for c in df.columns if c not in exclude and df[c].dtype in ["float64", "int64"]]
+        if fallback and (not features or len(features) < 20):
+            features = fallback
+            if report_path.exists():
+                logger.info("Report feature %d개 → 데이터 전체 numeric %d개 사용", len(report.get("final_features", [])), len(features))
+    features = [f for f in features if f in df.columns]
+    logger.info("Feature 수: %d", len(features))
+    return df, features
+
+
+def run_baselines(train_df: pd.DataFrame, test_df: pd.DataFrame, features: list) -> dict:
+    """Naive (y_{t-1}), 7-day seasonal naive MAPE."""
+    results = {}
+    lag1 = "price_per_kg_mean_lag1"
+    lag7 = "price_per_kg_mean_lag7" if "price_per_kg_mean_lag7" in train_df.columns else None
+
+    # Naive: y_t = y_{t-1}
+    if lag1 in train_df.columns and lag1 in test_df.columns:
+        valid = test_df[TARGET_COL].notna() & test_df[lag1].notna()
+        if valid.sum() > 0:
+            m = mape(test_df.loc[valid, TARGET_COL].values, test_df.loc[valid, lag1].values)
+            results["naive_lag1"] = m
+            logger.info("Baseline Naive (y_{t-1}) MAPE: %.2f%%", m)
+
+    # 7-day seasonal
+    if lag7 and lag7 in test_df.columns:
+        valid = test_df[TARGET_COL].notna() & test_df[lag7].notna()
+        if valid.sum() > 0:
+            m = mape(test_df.loc[valid, TARGET_COL].values, test_df.loc[valid, lag7].values)
+            results["seasonal_7d"] = m
+            logger.info("Baseline 7-day seasonal MAPE: %.2f%%", m)
+
+    return results
+
+
+def refine_features_shap(
+    train_df: pd.DataFrame,
+    features: list,
+    config: dict,
+) -> list:
+    """CV fold별 SHAP → 평균 importance, rank corr > 0.4 → 40~60개."""
+    from training.cv import expanding_walk_fold_indices
+
+    try:
+        import lightgbm as lgb
+        import shap
+    except ImportError:
+        logger.warning("shap 미설치 → feature refinement 스킵")
+        return features
+
+    cfg = config.get("feature_refine", {})
+    top_n = cfg.get("top_n_by_mean", 60)
+    min_corr = cfg.get("min_rank_corr", 0.4)
+    max_final = cfg.get("max_final", 60)
+    min_final = cfg.get("min_final", 40)
+
+    data = train_df.sort_values("date").reset_index(drop=True)
+    data = data[data[TARGET_COL].notna()].fillna(data.median(numeric_only=True))
+    X = data[features]
+    y = data[TARGET_COL]
+
+    ranks_per_fold = []
+    for train_idx, valid_idx in expanding_walk_fold_indices(
+        data, n_folds=5, valid_days=30
+    ):
+        X_tr, y_tr = X.iloc[train_idx], y.iloc[train_idx]
+        try:
+            from feature_selection.device_utils import fit_lgb_with_fallback
+            use_gpu = config.get("use_gpu", False)
+            m = lgb.LGBMRegressor(n_estimators=100, max_depth=5, verbosity=-1, random_state=RANDOM_STATE, device="gpu" if use_gpu else "cpu")
+            m = fit_lgb_with_fallback(m, X_tr, y_tr, "gpu" if use_gpu else "cpu")
+            expl = shap.TreeExplainer(m, X_tr)
+            sh = expl.shap_values(X_tr)
+            imp = np.abs(sh).mean(axis=0)
+            rk = pd.Series(imp, index=features).rank(ascending=False)
+            ranks_per_fold.append(rk)
+        except Exception as e:
+            logger.warning("SHAP fold 실패: %s", str(e)[:50])
+
+    if len(ranks_per_fold) < 2:
+        return features[:max_final]
+
+    rank_df = pd.DataFrame(ranks_per_fold)
+    mean_rank = rank_df.mean()
+    corrs = rank_df.T.corr()
+    np.fill_diagonal(corrs.values, np.nan)
+    mean_corr = np.nanmean(corrs.values)
+    if mean_corr < min_corr:
+        logger.info("Fold rank corr %.2f < %.2f → 상위 %d개만 유지", mean_corr, min_corr, top_n)
+
+    kept = mean_rank.nsmallest(min(top_n, len(features))).index.tolist()
+    kept = kept[:max_final]
+    if len(kept) < min_final:
+        kept = mean_rank.nsmallest(min_final).index.tolist()
+    logger.info("Feature refine: %d -> %d", len(features), len(kept))
+    return kept
+
+
+def expanding_cv_mape(
+    train_df: pd.DataFrame,
+    features: list,
+    model_name: str,
+    config: dict,
+) -> tuple:
+    """Expanding CV로 MAPE 평균, std, worst fold 반환. OOF 예측도 반환 (stacking용)."""
+    from training.cv import expanding_walk_fold_indices
+
+    data = train_df.sort_values("date").reset_index(drop=True)
+    data = data[data[TARGET_COL].notna()].copy()
+    data = data.fillna(data[features].median())
+    X = data[features]
+    y = data[TARGET_COL].values
+
+    oof_pred = np.full(len(data), np.nan)
+    fold_mapes = []
+
+    use_gpu = config.get("use_gpu", False)
+    for train_idx, valid_idx in expanding_walk_fold_indices(
+        data, n_folds=config.get("cv", {}).get("n_folds", 5),
+        valid_days=config.get("cv", {}).get("valid_days", 30),
+    ):
+        X_tr, y_tr = X.iloc[train_idx], y[train_idx]
+        X_val, y_val = X.iloc[valid_idx], y[valid_idx]
+
+        try:
+            if model_name == "lgb":
+                import lightgbm as lgb
+                from feature_selection.device_utils import fit_lgb_with_fallback
+                m = lgb.LGBMRegressor(**_lgb_params(config, use_gpu))
+                m = fit_lgb_with_fallback(m, X_tr, y_tr, "gpu" if use_gpu else "cpu")
+            elif model_name == "catboost":
+                import catboost as cb
+                try:
+                    m = cb.CatBoostRegressor(**_cb_params(config, use_gpu))
+                    m.fit(X_tr, y_tr)
+                except Exception as e:
+                    if use_gpu and ("gpu" in str(e).lower() or "cuda" in str(e).lower() or "device" in str(e).lower()):
+                        logger.warning("CatBoost GPU 실패, CPU fallback: %s", str(e)[:40])
+                        m = cb.CatBoostRegressor(**_cb_params(config, False))
+                        m.fit(X_tr, y_tr)
+                    else:
+                        raise
+            elif model_name == "elasticnet":
+                from sklearn.linear_model import ElasticNet
+                m = ElasticNet(alpha=0.1, l1_ratio=0.5, random_state=RANDOM_STATE)
+                m.fit(X_tr, y_tr)
+            else:
+                continue
+
+            pred = m.predict(X_val)
+            oof_pred[valid_idx] = pred
+            fold_mapes.append(mape(y_val, pred))
+        except Exception as e:
+            logger.warning("Fold 실패 (%s): %s", model_name, str(e)[:50])
+
+    if not fold_mapes:
+        return float("inf"), float("inf"), float("inf"), oof_pred
+    return np.mean(fold_mapes), np.std(fold_mapes), max(fold_mapes), oof_pred
+
+
+def run_pipeline(
+    data_path: Path = None,
+    config_path: Path = None,
+    seed: Optional[int] = None,
+    skip_feature_refine: bool = False,
+    skip_shap: bool = True,
+) -> dict:
+    """전체 파이프라인 실행."""
+    config_path = config_path or PROJECT_ROOT / "config" / "training_config.yaml"
+    config = {}
+    if config_path.exists():
+        try:
+            import yaml
+            with open(config_path, encoding="utf-8") as f:
+                config = yaml.safe_load(f) or {}
+        except Exception:
+            pass
+
+    use_gpu = config.get("use_gpu", False)
+    if use_gpu:
+        logger.info("GPU 모드 활성화 (LightGBM, CatBoost)")
+
+    df, features = load_data_and_features(data_path=data_path)
+    if len(features) < 5:
+        logger.warning("Feature 수 부족. feature selection pipeline 먼저 실행 권장.")
+
+    from training.split import train_test_split
+    split_cfg = config.get("split", {})
+    split_seed = seed if seed is not None else split_cfg.get("seed", RANDOM_STATE)
+    train_df, test_df, test_dates = train_test_split(
+        df,
+        test_days=split_cfg.get("test_days", 70),
+        test_ratio=split_cfg.get("test_ratio"),
+        seed=split_seed,
+    )
+
+    # Baseline
+    baseline_results = run_baselines(train_df, test_df, features)
+    results = {"baseline": baseline_results}
+
+    # Lag clustering: base별 대표 lag 1개 (94개 → ~40개 수준)
+    use_gpu = config.get("use_gpu", False)
+    cluster_cfg = config.get("feature_cluster", {})
+    if cluster_cfg.get("enabled", True) and len(features) > 30:
+        from training.feature_cluster import reduce_by_lag_representative
+        features = reduce_by_lag_representative(
+            train_df,
+            features,
+            target_col=TARGET_COL,
+            top_k_per_base=cluster_cfg.get("top_k_per_base", 1),
+            use_gpu=use_gpu,
+            random_state=RANDOM_STATE,
+        )
+        results["n_after_cluster"] = len(features)
+
+    # Feature refine: SHAP 또는 LGBM importance로 40~60개
+    if not skip_feature_refine and not skip_shap and len(features) > 60:
+        features = refine_features_shap(train_df, features, config)
+    elif len(features) > 60:
+        # SHAP 스킵 시 LGBM importance로 상위 60개
+        try:
+            import lightgbm as lgb
+            from feature_selection.device_utils import fit_lgb_with_fallback
+            tr = train_df[train_df[TARGET_COL].notna()].fillna(train_df.median(numeric_only=True))
+            m = lgb.LGBMRegressor(n_estimators=100, max_depth=5, verbosity=-1, random_state=RANDOM_STATE, device="gpu" if use_gpu else "cpu")
+            m = fit_lgb_with_fallback(m, tr[features], tr[TARGET_COL], "gpu" if use_gpu else "cpu")
+            imp = pd.Series(m.feature_importances_, index=features).nlargest(60)
+            features = imp.index.tolist()
+            logger.info("Feature 상위 60개 (LGBM importance) 사용")
+        except Exception as e:
+            logger.warning("Feature refine 실패: %s → 상위 60개", str(e)[:40])
+            features = features[:60]
+
+    # Model comparison
+    model_scores = {}
+    oof_lgb, oof_cb = None, None
+    for name in ["lgb", "catboost", "elasticnet"]:
+        try:
+            mean_mape, std_mape, worst_mape, oof = expanding_cv_mape(
+                train_df, features, name, config
+            )
+            model_scores[name] = {"mean": mean_mape, "std": std_mape, "worst": worst_mape}
+            if name == "lgb":
+                oof_lgb = oof
+            elif name == "catboost":
+                oof_cb = oof
+            logger.info("%s CV MAPE: %.2f%% ± %.2f (worst %.2f%%)", name, mean_mape, std_mape, worst_mape)
+        except ImportError as e:
+            logger.warning("%s 스킵: %s", name, str(e)[:50])
+
+    results["cv_scores"] = model_scores
+
+    # Stacking decision
+    use_stacking = False
+    if oof_lgb is not None and oof_cb is not None:
+        valid = np.isfinite(oof_lgb) & np.isfinite(oof_cb)
+        if valid.sum() > 10:
+            corr = np.corrcoef(oof_lgb[valid], oof_cb[valid])[0, 1]
+            thresh = config.get("stacking", {}).get("oof_corr_threshold", 0.95)
+            use_stacking = corr < thresh
+            logger.info("LGBM vs CatBoost OOF corr: %.3f → stacking: %s", corr, use_stacking)
+
+    # Best model selection
+    best_name = min(
+        (k for k, v in model_scores.items() if v["mean"] < 1e9),
+        key=lambda k: (model_scores[k]["mean"], model_scores[k]["std"]),
+        default="lgb",
+    )
+
+    # Final train on full train set
+    train_full = train_df[train_df[TARGET_COL].notna()].fillna(train_df.median(numeric_only=True))
+    X_tr = train_full[features]
+    y_tr = train_full[TARGET_COL]
+    X_te = test_df[features].fillna(train_full[features].median())
+    y_te = test_df[TARGET_COL].values
+    valid_te = np.isfinite(y_te)
+
+    final_model = None
+    pred = None
+
+    if use_stacking and oof_lgb is not None and oof_cb is not None:
+        # Stacking: LGBM + CatBoost → Ridge meta
+        import lightgbm as lgb
+        import catboost as cb
+        from sklearn.linear_model import Ridge
+        from feature_selection.device_utils import fit_lgb_with_fallback
+
+        m_lgb = lgb.LGBMRegressor(**_lgb_params(config, use_gpu))
+        m_lgb = fit_lgb_with_fallback(m_lgb, X_tr, y_tr, "gpu" if use_gpu else "cpu")
+        try:
+            m_cb = cb.CatBoostRegressor(**_cb_params(config, use_gpu))
+            m_cb.fit(X_tr, y_tr)
+        except Exception as e:
+            if use_gpu and ("gpu" in str(e).lower() or "cuda" in str(e).lower() or "device" in str(e).lower()):
+                logger.warning("CatBoost GPU 실패, CPU fallback")
+                m_cb = cb.CatBoostRegressor(**_cb_params(config, False))
+                m_cb.fit(X_tr, y_tr)
+            else:
+                raise
+        p_lgb = m_lgb.predict(X_tr)
+        p_cb = m_cb.predict(X_tr)
+        meta = Ridge(alpha=1.0, random_state=RANDOM_STATE)
+        meta.fit(np.column_stack([p_lgb, p_cb]), y_tr)
+        pred_lgb = m_lgb.predict(X_te)
+        pred_cb = m_cb.predict(X_te)
+        pred = meta.predict(np.column_stack([pred_lgb, pred_cb]))
+        best_name = "stacking"
+        logger.info("Stacking (LGBM+CatBoost→Ridge) 적용")
+    elif best_name == "lgb":
+        import lightgbm as lgb
+        from feature_selection.device_utils import fit_lgb_with_fallback
+        final_model = lgb.LGBMRegressor(**_lgb_params(config, use_gpu))
+        final_model = fit_lgb_with_fallback(final_model, X_tr, y_tr, "gpu" if use_gpu else "cpu")
+        pred = final_model.predict(X_te) if valid_te.sum() > 0 else None
+    elif best_name == "catboost":
+        import catboost as cb
+        try:
+            final_model = cb.CatBoostRegressor(**_cb_params(config, use_gpu))
+            final_model.fit(X_tr, y_tr)
+        except Exception as e:
+            if use_gpu and ("gpu" in str(e).lower() or "cuda" in str(e).lower() or "device" in str(e).lower()):
+                logger.warning("CatBoost GPU 실패, CPU fallback")
+                final_model = cb.CatBoostRegressor(**_cb_params(config, False))
+                final_model.fit(X_tr, y_tr)
+            else:
+                raise
+        pred = final_model.predict(X_te) if valid_te.sum() > 0 else None
+    elif best_name == "elasticnet":
+        from sklearn.linear_model import ElasticNet
+        final_model = ElasticNet(alpha=0.1, l1_ratio=0.5, random_state=RANDOM_STATE)
+        final_model.fit(X_tr, y_tr)
+        pred = final_model.predict(X_te) if valid_te.sum() > 0 else None
+
+    if pred is not None and valid_te.sum() > 0:
+        test_mape = mape(y_te[valid_te], pred[valid_te])
+        results["test_mape"] = test_mape
+        logger.info("Test MAPE (%s): %.2f%%", best_name, test_mape)
+
+        # Per-season MAPE
+        test_df = test_df.copy()
+        test_df["_pred"] = pred
+        test_df["_month"] = pd.to_datetime(test_df["date"].astype(str), format="%Y%m%d").dt.month
+        test_df["_season"] = test_df["_month"].apply(_month_to_season)
+        season_mape = {}
+        for s in SEASON_MONTHS:
+            mask = (test_df["_season"] == s) & test_df[TARGET_COL].notna() & np.isfinite(test_df["_pred"])
+            if mask.sum() > 0:
+                season_mape[s] = mape(
+                    test_df.loc[mask, TARGET_COL].values,
+                    test_df.loc[mask, "_pred"].values,
+                )
+        results["season_mape"] = season_mape
+        for s, m in season_mape.items():
+            logger.info("  %s MAPE: %.2f%%", s, m)
+
+    results["best_model"] = best_name
+    results["use_stacking"] = use_stacking
+    results["n_features"] = len(features)
+    results["test_dates"] = len(test_dates)
+
+    # Report
+    report_path = PROJECT_ROOT / "reports" / "training_pipeline_report.md"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "# Training Pipeline Report",
+        "",
+        "## Baseline",
+        "| Model | MAPE (%) |",
+        "|-------|----------|",
+    ]
+    for k, v in baseline_results.items():
+        lines.append(f"| {k} | {v:.2f} |")
+    lines.extend([
+        "",
+        "## CV Scores",
+        "| Model | Mean | Std | Worst |",
+        "|-------|------|-----|-------|",
+    ])
+    for k, v in model_scores.items():
+        lines.append(f"| {k} | {v['mean']:.2f} | {v['std']:.2f} | {v['worst']:.2f} |")
+    lines.extend([
+        "",
+        f"## Best Model: {best_name}",
+        f"Test MAPE: {results['test_mape']:.2f}%" if isinstance(results.get('test_mape'), (int, float)) else "Test MAPE: -",
+        "",
+        "## Season MAPE",
+        "| Season | MAPE (%) |",
+        "|--------|----------|",
+    ])
+    for s, m in results.get("season_mape", {}).items():
+        lines.append(f"| {s} | {m:.2f} |")
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+    logger.info("Report: %s", report_path)
+
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Training pipeline")
+    parser.add_argument("--data-path", type=str, default=None)
+    parser.add_argument("--config", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=None, help="Split 고정용 seed (기본: config)")
+    parser.add_argument("--skip-feature-refine", action="store_true")
+    parser.add_argument("--skip-shap", action="store_true", help="SHAP feature refinement 스킵 (기본)")
+    args = parser.parse_args()
+
+    run_pipeline(
+        data_path=Path(args.data_path) if args.data_path else None,
+        config_path=Path(args.config) if args.config else None,
+        seed=args.seed,
+        skip_feature_refine=args.skip_feature_refine,
+        skip_shap=args.skip_shap,
+    )
+
+
+if __name__ == "__main__":
+    main()
